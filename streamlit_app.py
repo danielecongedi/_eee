@@ -1,28 +1,33 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from datetime import date, datetime
-from dateutil.relativedelta import relativedelta
+# streamlit_app.py
 import re
+from io import BytesIO
+from datetime import date, datetime
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import requests
-from io import StringIO, BytesIO
+import streamlit as st
+from dateutil.relativedelta import relativedelta
 
+# =========================
+# Page
+# =========================
 st.set_page_config(page_title="Bank Spend Analytics", page_icon="🏦", layout="wide")
-
 st.markdown(
     """
     <style>
       html, body, [class*="css"] { font-size: 15px; }
       .small-note { opacity: 0.8; font-size: 0.9rem; }
+      .ok { background: #0f172a10; padding: 0.75rem 1rem; border-radius: 0.75rem; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-# -------------------------
+# =========================
 # Helpers
-# -------------------------
+# =========================
 def _lower(s):
     return str(s).strip().lower()
 
@@ -30,10 +35,20 @@ def _normalize_colname(s: str) -> str:
     s = _lower(s)
     for ch in ["\n", "\t", "\r"]:
         s = s.replace(ch, " ")
-    s = " ".join(s.split())
-    return s
+    return " ".join(s.split())
+
+def safe_date_parse(s: pd.Series) -> pd.Series:
+    # robust: accetta date/str, dayfirst Italia
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def parse_amount_series(s: pd.Series) -> pd.Series:
+    """
+    Gestisce:
+    - numerici già numerici
+    - formati IT: 1.234,56
+    - formati EN: 1,234.56
+    - "€", spazi, NBSP, parentesi negative
+    """
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
 
@@ -44,7 +59,7 @@ def parse_amount_series(s: pd.Series) -> pd.Series:
     has_dot = ss.str.contains(r"\.", regex=True)
     has_comma = ss.str.contains(r",", regex=True)
 
-    out = pd.Series([np.nan] * len(ss), index=ss.index, dtype="float64")
+    out = pd.Series(np.nan, index=ss.index, dtype="float64")
 
     both = has_dot & has_comma
     if both.any():
@@ -71,13 +86,9 @@ def parse_amount_series(s: pd.Series) -> pd.Series:
 
     neither = ~has_dot & ~has_comma
     if neither.any():
-        sub = ss[neither]
-        out.loc[sub.index] = pd.to_numeric(sub, errors="coerce")
+        out.loc[ss[neither].index] = pd.to_numeric(ss[neither], errors="coerce")
 
     return out
-
-def safe_date_parse(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
 def add_months(d: date, n: int) -> date:
     return (datetime(d.year, d.month, 1) + relativedelta(months=n)).date()
@@ -93,7 +104,7 @@ def guess_columns(df: pd.DataFrame):
                     return orig
         return None
 
-    col_date = pick_any(["data contabile", "data", "date", "valuta", "data operazione", "data contabile"])
+    col_date = pick_any(["data contabile", "data", "date", "valuta", "data operazione"])
     col_desc = pick_any(["descrizione", "descr", "causal", "merchant", "esercente", "beneficiario", "ordinante", "dettagli"])
     col_balance = pick_any(["saldo", "balance", "disponibile", "saldo contabile", "saldo disponibile"])
 
@@ -103,12 +114,14 @@ def guess_columns(df: pd.DataFrame):
 
     return col_date, col_amount, col_debit, col_credit, col_desc, col_balance
 
-def build_amount_from_debit_credit(df: pd.DataFrame, col_debit: str, col_credit: str) -> pd.Series:
-    d = parse_amount_series(df[col_debit]) if col_debit else pd.Series([np.nan]*len(df), index=df.index)
-    c = parse_amount_series(df[col_credit]) if col_credit else pd.Series([np.nan]*len(df), index=df.index)
+def build_amount_from_debit_credit(df: pd.DataFrame, col_debit: str | None, col_credit: str | None) -> pd.Series:
+    d = parse_amount_series(df[col_debit]) if col_debit else pd.Series(np.nan, index=df.index)
+    c = parse_amount_series(df[col_credit]) if col_credit else pd.Series(np.nan, index=df.index)
+    # entrate positive, uscite negative
     return c.fillna(0.0) - d.fillna(0.0)
 
 def dedupe_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    # Deduplica soft su (date, amount, description, file)
     key_cols = ["date", "amount", "description", "__source_file"]
     for k in key_cols:
         if k not in df.columns:
@@ -117,8 +130,9 @@ def dedupe_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
 def extract_balance_from_text(text: str):
     """
-    Supporta stringhe tipo:
+    Se nel testo (prima riga) trovi:
     'saldo contabile al 26/02/2026 di euro +21039,34'
+    estrai saldo e data.
     """
     first_line = text.splitlines()[0] if text else ""
     m_val = re.search(r"([+-]?\d[\d\.]*,\d+)", first_line)
@@ -131,61 +145,74 @@ def extract_balance_from_text(text: str):
         bal_date = datetime.strptime(m_date.group(1), "%d/%m/%Y").date()
     return bal, bal_date
 
-def normalize_gsheet_csv_url(url: str) -> str:
+def to_gsheet_xlsx_export_url(url: str) -> str:
     """
-    Accetta anche URL sbagliati tipo .../pubhtml=csv e li normalizza.
-    Formati supportati:
-    - .../pubhtml  -> .../pub?output=csv
-    - .../pubhtml?gid=0 -> .../pub?output=csv&gid=0
-    - .../export?format=csv&gid=0 -> ok
-    - .../pub?output=csv -> ok
+    Converte link /edit di Google Sheet in /export?format=xlsx&gid=...
+    Accetta:
+    - https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0
+    - https://docs.google.com/spreadsheets/d/<ID>/edit?gid=0#gid=0
+    - già export?format=xlsx...
     """
     u = url.strip()
-    u = u.replace("pubhtml=csv", "pub?output=csv")
-    u = u.replace("/pubhtml", "/pub?output=csv")
-    # se è già export o pub?output=csv, ok
-    if "output=csv" in u or "format=csv" in u:
+    if "export?format=xlsx" in u:
         return u
-    # fallback: prova aggiungere output=csv se è /pub
-    if u.endswith("/pub"):
-        return u + "?output=csv"
-    return u
+
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", u)
+    if not m:
+        return u  # fallback: lo userà comunque, ma probabilmente non funziona
+    file_id = m.group(1)
+
+    gid = "0"
+    mg = re.search(r"[#?&]gid=(\d+)", u)
+    if mg:
+        gid = mg.group(1)
+
+    return f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx&gid={gid}"
 
 @st.cache_data(show_spinner=False)
-def load_from_gsheet(csv_url: str) -> tuple[pd.DataFrame, list]:
-    """
-    Ritorna (raw_df, header_balances)
-    header_balances: [(source, balance, date)]
-    """
+def load_from_gsheet_xlsx(xlsx_url: str, sheet_name: str | int | None = None) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(csv_url, headers=headers, timeout=30)
+    r = requests.get(xlsx_url, headers=headers, timeout=60)
     r.raise_for_status()
-    text = r.text
+    content = BytesIO(r.content)
+    df = pd.read_excel(content, sheet_name=sheet_name if sheet_name is not None else 0, engine="openpyxl")
+    return df
 
+@st.cache_data(show_spinner=False)
+def load_csv_like_bank(file_bytes: bytes) -> tuple[pd.DataFrame, tuple | None]:
+    """
+    CSV banca con header saldo + tabella da riga 3.
+    Ritorna df e (bal, bal_date) se trovati.
+    """
+    text = file_bytes.decode("utf-8-sig", errors="ignore")
     bal, bal_date = extract_balance_from_text(text)
+    df = pd.read_csv(BytesIO(file_bytes), sep=";", skiprows=2, decimal=",")
+    return df, (bal, bal_date)
 
-    # Provo a leggere come "movimenti" con skiprows=2 e sep=";"
-    # Se fallisce, fallback su lettura standard.
-    try:
-        df = pd.read_csv(StringIO(text), sep=";", skiprows=2, decimal=",")
-    except Exception:
-        df = pd.read_csv(StringIO(text))
+def best_header_balance(header_balances: list[tuple[str, float | None, date | None]]):
+    # sceglie il saldo più recente per data, altrimenti il primo valido
+    best = None
+    for src, bal, bdate in header_balances:
+        if bal is None:
+            continue
+        if best is None:
+            best = (src, bal, bdate)
+        else:
+            if bdate and best[2] and bdate > best[2]:
+                best = (src, bal, bdate)
+            elif bdate and not best[2]:
+                best = (src, bal, bdate)
+    return best  # (src, bal, date)
 
-    df["__sheet"] = "GoogleSheets"
-    df["__source_file"] = "GoogleSheets"
-    return df, [("GoogleSheets", bal, bal_date)]
-
-# -------------------------
+# =========================
 # Sidebar
-# -------------------------
+# =========================
 st.sidebar.title("⚙️ Impostazioni")
 
 st.sidebar.subheader("📥 Fonte dati")
-mode = st.sidebar.radio("Sorgente", ["Google Sheets (secrets)", "Upload file"], index=0)
+mode = st.sidebar.radio("Sorgente", ["Google Sheets (XLSX via Secrets)", "Upload file"], index=0)
 
-sheet_mode = st.sidebar.radio("Sheet (solo Excel)", ["Tutti gli sheet", "Solo questo sheet"], index=0)
-sheet_name = st.sidebar.text_input("Nome sheet (se 'Solo questo sheet')", value="")
-
+# Opzioni forecast/target
 st.sidebar.divider()
 include_pending = st.sidebar.checkbox("Includi 'Non contabilizzato' in KPI/Forecast", value=False)
 
@@ -203,31 +230,55 @@ else:
     target_savings = st.sidebar.number_input("🎯 Target risparmio totale (€)", value=3000.0, step=100.0)
     months_to_target = st.sidebar.selectbox("📅 Entro quanti mesi", [3, 6, 9, 12], index=1)
 
-# -------------------------
-# Load data
-# -------------------------
+# =========================
+# Load data (robusto, senza crash)
+# =========================
 st.title("🏦 Bank Spend Analytics")
-st.caption("Sorgente: Google Sheets (via Secrets) oppure Upload. KPI, trend, forecast e massimale spesa per target.")
+st.caption("Google Sheets (XLSX via Secrets) oppure Upload. KPI, trend, forecast e massimale spesa per target.")
 
 raw = pd.DataFrame()
-header_balances = []
+header_balances: list[tuple[str, float | None, date | None]] = []
 
-if mode == "Google Sheets (secrets)":
-    if "CSV_URL" not in st.secrets:
-        st.error("Manca CSV_URL nei Secrets. Aggiungi in Secrets: CSV_URL = \"...\"")
-        st.stop()
-
-    csv_url = normalize_gsheet_csv_url(st.secrets["CSV_URL"])
+if mode == "Google Sheets (XLSX via Secrets)":
+    # NON usiamo "in" su st.secrets se manca il file: può lanciare StreamlitSecretNotFoundError
     try:
-        raw, header_balances = load_from_gsheet(csv_url)
-        st.sidebar.success("Google Sheets caricato ✅")
-        st.sidebar.caption(csv_url)
-    except Exception as e:
-        st.error(f"Errore caricamento Google Sheets: {e}")
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+
+    xlsx_url = None
+    if isinstance(secrets, dict):
+        xlsx_url = secrets.get("XLSX_URL") or secrets.get("GSHEET_URL")  # fallback se lo chiami diversamente
+
+    if not xlsx_url:
+        st.error(
+            "Manca il secrets file.\n\n"
+            "In Codespaces crea **.streamlit/secrets.toml** con:\n"
+            'XLSX_URL = "https://docs.google.com/spreadsheets/d/<ID>/export?format=xlsx&gid=0"\n\n'
+            "Oppure scegli 'Upload file' a sinistra."
+        )
         st.stop()
+
+    xlsx_url = to_gsheet_xlsx_export_url(xlsx_url)
+
+    # Sheet selector (opzionale): se vuoi forzare un foglio
+    sheet_pick = st.sidebar.text_input("Nome sheet (opzionale)", value="").strip()
+    sheet_name = sheet_pick if sheet_pick else None
+
+    try:
+        raw = load_from_gsheet_xlsx(xlsx_url, sheet_name=sheet_name)
+        raw["__sheet"] = sheet_pick if sheet_pick else "Sheet(1)"
+        raw["__source_file"] = "GoogleSheetsXLSX"
+        st.sidebar.success("Google Sheets XLSX caricato ✅")
+    except Exception as e:
+        st.error(f"Errore caricamento Google Sheets XLSX: {e}\n\n"
+                 "Controlla che il foglio sia accessibile (chiunque col link può visualizzare) "
+                 "e che l'URL sia in formato export?format=xlsx.")
+        st.stop()
+
 else:
     uploads = st.sidebar.file_uploader(
-        "Carica estratti conto (Excel / CSV)",
+        "Carica estratti (Excel / CSV)",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True
     )
@@ -240,20 +291,14 @@ else:
         name = getattr(f, "name", "upload")
         suffix = name.lower().split(".")[-1]
 
-        if suffix == "csv":
-            file_bytes = f.getvalue()
-            text = file_bytes.decode("utf-8-sig", errors="ignore")
-            bal, bal_date = extract_balance_from_text(text)
-            header_balances.append((name, bal, bal_date))
-
-            df = pd.read_csv(BytesIO(file_bytes), sep=";", skiprows=2, decimal=",")
-            df["__sheet"] = "CSV"
-            df["__source_file"] = name
-            frames.append(df)
-        else:
-            if sheet_mode == "Solo questo sheet" and sheet_name.strip():
-                df = pd.read_excel(f, sheet_name=sheet_name.strip(), engine="openpyxl")
-                df["__sheet"] = sheet_name.strip()
+        try:
+            if suffix == "csv":
+                file_bytes = f.getvalue()
+                df, bal_info = load_csv_like_bank(file_bytes)
+                if bal_info:
+                    bal, bal_date = bal_info
+                    header_balances.append((name, bal, bal_date))
+                df["__sheet"] = "CSV"
                 df["__source_file"] = name
                 frames.append(df)
             else:
@@ -265,16 +310,19 @@ else:
                     dfi["__sheet"] = sh
                     dfi["__source_file"] = name
                     frames.append(dfi)
+        except Exception as e:
+            st.warning(f"File '{name}' non letto (errore: {e})")
 
-    raw = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    if frames:
+        raw = pd.concat(frames, ignore_index=True, sort=False)
 
 if raw.empty:
-    st.warning("Nessun dato caricato.")
+    st.warning("Nessun dato caricato (o non leggibile).")
     st.stop()
 
-# -------------------------
-# Mapping
-# -------------------------
+# =========================
+# Mapping (auto + UI)
+# =========================
 auto_date, auto_amount, auto_debit, auto_credit, auto_desc, auto_balance = guess_columns(raw)
 
 st.subheader("Mapping colonne")
@@ -323,10 +371,11 @@ col_balance = c4.selectbox(
 
 flip_sign = st.checkbox("⚠️ Inverti segno importi (se entrate risultano negative)", value=False)
 
-# -------------------------
-# Normalize
-# -------------------------
+# =========================
+# Normalize dataset
+# =========================
 df = raw.copy()
+
 df["date_raw"] = df[col_date].astype(str).str.strip()
 df["is_pending"] = df["date_raw"].str.lower().eq("non contabilizzato")
 df["date"] = safe_date_parse(df[col_date])
@@ -345,8 +394,8 @@ if col_balance != "(nessuna)":
 else:
     df["balance"] = np.nan
 
+# pulizia minima
 df = df.dropna(subset=["amount"]).copy()
-
 if flip_sign:
     df["amount"] = -df["amount"]
 
@@ -360,13 +409,18 @@ df_main = df_main.sort_values("date").reset_index(drop=True)
 df_main["month"] = df_main["date"].dt.to_period("M").astype(str)
 df_main = dedupe_transactions(df_main)
 
-# -------------------------
+if df_main.empty:
+    st.warning("Dopo i filtri (pending/date) non restano movimenti validi.")
+    st.stop()
+
+# =========================
 # KPI
-# -------------------------
+# =========================
 income = df_main.loc[df_main["amount"] > 0, "amount"].sum()
 expense = -df_main.loc[df_main["amount"] < 0, "amount"].sum()
 net = income - expense
 
+# saldo attuale: 1) colonna saldo 2) header saldo (solo upload CSV) 3) cumulata
 balance_note = ""
 if df_main["balance"].notna().any():
     dfx = df_main[df_main["balance"].notna()].copy()
@@ -374,24 +428,12 @@ if df_main["balance"].notna().any():
     current_balance = float(df_main.loc[last_idx, "balance"])
     balance_note = "da colonna Saldo"
 else:
-    # priorità a header saldo
-    best = None
-    for (src, bal, bdate) in header_balances:
-        if bal is None:
-            continue
-        if best is None:
-            best = (src, bal, bdate)
-        else:
-            # se ho date, prendo il più recente
-            if bdate and best[2] and bdate > best[2]:
-                best = (src, bal, bdate)
-            elif bdate and not best[2]:
-                best = (src, bal, bdate)
+    best = best_header_balance(header_balances)
     if best:
         current_balance = float(best[1])
-        balance_note = "da intestazione (saldo contabile)"
+        balance_note = "da intestazione CSV (saldo contabile)"
     else:
-        current_balance = float(df_main["amount"].cumsum().iloc[-1]) if len(df_main) else 0.0
+        current_balance = float(df_main["amount"].cumsum().iloc[-1])
         balance_note = "calcolato (cumulata movimenti)"
 
 m = df_main.groupby("month", as_index=False).agg(
@@ -413,9 +455,9 @@ if (~include_pending) and df["is_pending"].any():
 
 st.markdown("---")
 
-# -------------------------
+# =========================
 # Charts
-# -------------------------
+# =========================
 left, right = st.columns([2, 1])
 
 with left:
@@ -447,9 +489,9 @@ else:
 
 st.markdown("---")
 
-# -------------------------
+# =========================
 # Forecast
-# -------------------------
+# =========================
 st.subheader("Forecast trend e target")
 
 series = m.sort_values("month").copy()
@@ -473,34 +515,29 @@ pred_exp = forecast_expense_monthly(forecast_method, int(forecast_horizon))
 avg_income = float(hist["income"].mean()) if len(hist) else 0.0
 pred_inc = [avg_income for _ in range(int(forecast_horizon))]
 
-if len(series) == 0:
-    st.warning("Dati mensili insufficienti per forecast (dopo filtri).")
-else:
-    last_month = series["month"].iloc[-1]
+last_month = series["month"].iloc[-1]
 
-    def month_label_from_str(ym: str, offset: int):
-        y, mo = map(int, ym.split("-"))
-        d0 = date(y, mo, 1)
-        d1 = d0 + relativedelta(months=offset)
-        return f"{d1.year:04d}-{d1.month:02d}"
+def month_label_from_str(ym: str, offset: int):
+    y, mo = map(int, ym.split("-"))
+    d0 = date(y, mo, 1)
+    d1 = d0 + relativedelta(months=offset)
+    return f"{d1.year:04d}-{d1.month:02d}"
 
-    future_months = [month_label_from_str(last_month, i + 1) for i in range(int(forecast_horizon))]
+future_months = [month_label_from_str(last_month, i + 1) for i in range(int(forecast_horizon))]
 
-    f = pd.DataFrame({"month": future_months, "income_fc": pred_inc, "expense_fc": pred_exp})
-    f["net_fc"] = f["income_fc"] - f["expense_fc"]
+f = pd.DataFrame({"month": future_months, "income_fc": pred_inc, "expense_fc": pred_exp})
+f["net_fc"] = f["income_fc"] - f["expense_fc"]
 
-    figf = go.Figure()
-    figf.add_trace(go.Scatter(x=series["month"], y=series["expense"], mode="lines+markers", name="Uscite (storico)"))
-    figf.add_trace(go.Scatter(x=f["month"], y=f["expense_fc"], mode="lines+markers", name="Uscite (forecast)", line=dict(dash="dash")))
-    figf.update_layout(font=dict(size=11), margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(figf, use_container_width=True)
+figf = go.Figure()
+figf.add_trace(go.Scatter(x=series["month"], y=series["expense"], mode="lines+markers", name="Uscite (storico)"))
+figf.add_trace(go.Scatter(x=f["month"], y=f["expense_fc"], mode="lines+markers", name="Uscite (forecast)", line=dict(dash="dash")))
+figf.update_layout(font=dict(size=11), margin=dict(l=10, r=10, t=30, b=10))
+st.plotly_chart(figf, use_container_width=True)
 
-# -------------------------
+# =========================
 # Target & cap spesa
-# -------------------------
+# =========================
 st.subheader("Massimale ottimale di spesa media mensile per raggiungere il target")
-
-current_net_worth = current_balance
 
 if target_mode == "Target saldo a una data":
     today = date.today()
@@ -508,7 +545,7 @@ if target_mode == "Target saldo a una data":
     months = max(1, months)
 
     expected_income_total = avg_income * months
-    max_exp_total = current_net_worth + expected_income_total - target_balance
+    max_exp_total = current_balance + expected_income_total - target_balance
     max_exp_month = max(0.0, max_exp_total / months)
 
     st.write(f"Orizzonte: **{months} mesi** (fino a {target_date.strftime('%d %b %Y')})")
@@ -526,9 +563,9 @@ else:
 
 st.markdown("---")
 
-# -------------------------
+# =========================
 # Tables
-# -------------------------
+# =========================
 st.subheader("Movimenti (più recenti)")
 view = df_main.sort_values("date", ascending=False).copy()
 view["date"] = view["date"].dt.strftime("%Y-%m-%d")
