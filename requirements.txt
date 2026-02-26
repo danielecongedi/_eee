@@ -5,3 +5,4 @@ plotly
 openpyxl
 python-dateutil
 requests
+scikit-learn
