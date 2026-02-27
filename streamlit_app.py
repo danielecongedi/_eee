@@ -4,7 +4,6 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 
@@ -22,12 +21,6 @@ NET_ORANGE = "#F28C28"
 # =========================
 # Helpers base
 # =========================
-def safe_secrets():
-    try:
-        return dict(st.secrets)
-    except Exception:
-        return {}
-
 def normalize_col_lookup(cols):
     return {str(c).strip().lower(): c for c in cols}
 
@@ -79,12 +72,6 @@ def parse_amount(series: pd.Series) -> pd.Series:
     return out
 
 @st.cache_data(show_spinner=False)
-def load_xlsx_from_url(url: str, sheet_name: str | None = None) -> pd.DataFrame:
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    return pd.read_excel(BytesIO(r.content), sheet_name=(sheet_name if sheet_name else 0), engine="openpyxl")
-
-@st.cache_data(show_spinner=False)
 def load_xlsx_from_upload(file_bytes: bytes, sheet_name: str | None = None) -> pd.DataFrame:
     return pd.read_excel(BytesIO(file_bytes), sheet_name=(sheet_name if sheet_name else 0), engine="openpyxl")
 
@@ -127,6 +114,7 @@ def categorize_spend_rule(desc: str) -> str | None:
         return "Casa / Cura persona"
     if any(k in d for k in ["coop", "conad", "esselunga", "carrefour", "lidl", "aldi", "super", "market", "ristor", "trattor", "oster", "pizzer", "bar", "gelat", "pescher", "maceller", "forno", "gastronom"]):
         return "Cibo / Spesa / Ristoranti"
+
     return None
 
 # =========================
@@ -257,40 +245,23 @@ def forecast_with_shape(series: pd.Series, months: pd.Series, horizon: int) -> l
 
 
 # =========================
-# MAIN UI: Fonte dati (upload o URL)
+# UI: Upload obbligatorio
 # =========================
-st.title("🏦 Bank Spend Analytics")
+st.title("🏦 Bank Spend Analytics (Excel upload)")
 
-st.sidebar.header("📥 Fonte dati")
-uploaded = st.sidebar.file_uploader(
-    "Trascina qui l'Excel (drag & drop)",
+uploaded = st.file_uploader(
+    "Trascina qui l'Excel (drag & drop) oppure clicca per selezionare",
     type=["xlsx", "xls"],
-    help="Se carichi un file, verrà usato questo. Altrimenti usa XLSX_URL dai secrets."
 )
 
-sec = safe_secrets()
-xlsx_url = (sec.get("XLSX_URL") or "").strip()
-sheet_name = (sec.get("SHEET_NAME") or "").strip()
-
-use_url = False
 if uploaded is None:
-    if xlsx_url:
-        use_url = True
-        st.sidebar.caption("Nessun file caricato: uso XLSX_URL da secrets.")
-    else:
-        st.error("Carica un file Excel (drag & drop) oppure configura XLSX_URL nei secrets.")
-        st.stop()
-else:
-    st.sidebar.caption("File caricato: uso upload (priorità su XLSX_URL).")
+    st.info("Carica un file Excel per iniziare.")
+    st.stop()
 
-# carica dati
 try:
-    if uploaded is not None:
-        raw = load_xlsx_from_upload(uploaded.getvalue(), sheet_name if sheet_name else None)
-    else:
-        raw = load_xlsx_from_url(xlsx_url, sheet_name if sheet_name else None)
+    raw = load_xlsx_from_upload(uploaded.getvalue(), sheet_name=None)
 except Exception as e:
-    st.error(f"Errore caricamento Excel: {e}")
+    st.error(f"Errore lettura Excel: {e}")
     st.stop()
 
 # validazione colonne
@@ -329,7 +300,7 @@ with topA:
     )
     d_from, d_to = period if isinstance(period, tuple) else (min_d, max_d)
 with topB:
-    current_balance = st.number_input("Saldo contabile attuale (€) (manuale)", value=21039.34, step=100.0)
+    current_balance = st.number_input("Saldo contabile attuale (€) (manuale)", value=0.0, step=100.0)
 
 dfp = df[(df["date"].dt.date >= d_from) & (df["date"].dt.date <= d_to)].copy()
 if dfp.empty:
@@ -373,6 +344,7 @@ st.markdown("---")
 # =========================
 st.subheader("Cumulata saldo nel periodo (da movimenti)")
 
+# Se current_balance è 0 (default), la cumulata sarà “relativa”
 saldo_iniziale_stimato = float(current_balance) - float(m["net"].sum())
 use_manual_start = st.checkbox("Imposta manualmente saldo iniziale del periodo", value=False)
 if use_manual_start:
