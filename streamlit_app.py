@@ -22,7 +22,7 @@ except Exception:
 # CONFIG
 # =========================
 st.set_page_config(page_title="Dashboard Spese", layout="wide", page_icon="💳")
-st.title("💳 Dashboard spese (regole + clustering leggero + simulazioni)")
+st.title("💳 Dashboard Bank")
 
 MIN_ROWS_FOR_CLUSTER = 30
 
