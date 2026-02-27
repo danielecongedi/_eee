@@ -1,738 +1,593 @@
-import streamlit as st
-import pandas as pd
+from io import BytesIO
+from datetime import date, datetime
+
 import numpy as np
-import re
-from datetime import datetime
-
-import plotly.express as px
+import pandas as pd
 import plotly.graph_objects as go
+import requests
+import streamlit as st
+from dateutil.relativedelta import relativedelta
 
-# sklearn opzionale (clustering leggero)
-try:
-    from sklearn.cluster import KMeans
-    from sklearn.preprocessing import normalize
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.linear_model import LinearRegression
-    SKLEARN_OK = True
-except Exception:
-    SKLEARN_OK = False
-
+st.set_page_config(page_title="Bank Spend Analytics", page_icon="🏦", layout="wide")
 
 # =========================
-# CONFIG
+# COLONNE ATTESE (nel file)
 # =========================
-st.set_page_config(page_title="Dashboard Spese", layout="wide", page_icon="💳")
-st.title("💳 Dashboard Bank")
+COL_DATE = "Data valuta"
+COL_DESC = "Descrizione"
+COL_AMOUNT = "Importo"
 
-MIN_ROWS_FOR_CLUSTER = 30
-
-MACRO_TAGS_BASE = [
-    "Viaggi", "Cibo", "Casa", "Auto/Trasporti", "Abbonamenti",
-    "Shopping", "Salute", "Svago", "Commissioni/Banca", "Entrate", "Altro"
-]
-
-PAYMENT_TYPES = [
-    "Carta", "Bonifico", "Addebito diretto", "Prelievo", "PagoPA-F24", "Commissioni", "Altro"
-]
+NET_ORANGE = "#F28C28"
 
 # =========================
-# HELPERS
+# Helpers base
 # =========================
-def norm_text(x) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    s = str(x).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+def safe_secrets():
+    try:
+        return dict(st.secrets)
+    except Exception:
+        return {}
 
-def infer_col(df: pd.DataFrame, candidates):
-    cols = list(df.columns)
-    cols_l = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand.lower() in cols_l:
-            return cols_l[cand.lower()]
-    for c in cols:
-        cl = c.lower()
-        if any(k in cl for k in candidates):
-            return c
-    return None
+def normalize_col_lookup(cols):
+    return {str(c).strip().lower(): c for c in cols}
+
+def parse_date(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+    s = series.astype(str).str.strip()
+    s = s.str.replace(".", "/", regex=False).str.replace("-", "/", regex=False)
+    return pd.to_datetime(s, dayfirst=True, errors="coerce", infer_datetime_format=True)
 
 def parse_amount(series: pd.Series) -> pd.Series:
-    """
-    Parsing robusto IT/EN senza “sproporzioni”.
-    - numerico -> usa diretto
-    - stringa:
-      * 1.234,56 -> 1234.56
-      * 1234,56  -> 1234.56
-      * 1234.56  -> 1234.56 (non rimuovere punti)
-      * (123,45) -> -123.45
-    """
-    def clean_value(val):
-        if pd.isna(val):
-            return np.nan
+    # robust IT/EN
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
 
-        if isinstance(val, (int, float, np.integer, np.floating)):
-            return float(val)
+    s = series.astype(str).str.strip()
+    s = s.str.replace("€", "", regex=False)
+    s = s.str.replace("\u00A0", "", regex=False)
+    s = s.str.replace(" ", "", regex=False)
+    s = s.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
 
-        s = str(val).strip()
-        s = s.replace("€", "").replace("\u00a0", "").replace(" ", "")
+    has_dot = s.str.contains(r"\.", regex=True)
+    has_comma = s.str.contains(r",", regex=True)
 
-        if s.startswith("(") and s.endswith(")"):
-            s = "-" + s[1:-1]
+    out = pd.Series(np.nan, index=s.index, dtype="float64")
 
-        if "," in s and "." in s:
-            # se la virgola è dopo il punto -> formato IT (1.234,56)
-            if s.rfind(",") > s.rfind("."):
-                s = s.replace(".", "").replace(",", ".")
-            else:
-                # formato EN con migliaia 1,234.56
-                s = s.replace(",", "")
-        elif "," in s and "." not in s:
-            s = s.replace(",", ".")
-        else:
-            pass
+    both = has_dot & has_comma
+    if both.any():
+        sub = s[both]
+        last_is_comma = sub.str.rfind(",") > sub.str.rfind(".")
+        it = sub[last_is_comma].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+        en = sub[~last_is_comma].str.replace(",", "", regex=False)
+        out.loc[it.index] = pd.to_numeric(it, errors="coerce")
+        out.loc[en.index] = pd.to_numeric(en, errors="coerce")
 
-        try:
-            return float(s)
-        except ValueError:
-            return np.nan
+    only_comma = has_comma & ~has_dot
+    if only_comma.any():
+        sub = s[only_comma].str.replace(",", ".", regex=False)
+        out.loc[sub.index] = pd.to_numeric(sub, errors="coerce")
 
-    return series.apply(clean_value)
+    only_dot = has_dot & ~has_comma
+    if only_dot.any():
+        out.loc[s[only_dot].index] = pd.to_numeric(s[only_dot], errors="coerce")
+
+    neither = ~has_dot & ~has_comma
+    if neither.any():
+        out.loc[s[neither].index] = pd.to_numeric(s[neither], errors="coerce")
+
+    return out
 
 @st.cache_data(show_spinner=False)
-def load_first_sheet(file_bytes: bytes):
-    xls = pd.ExcelFile(file_bytes)
-    first_sheet = xls.sheet_names[0]
+def load_xlsx_from_url(url: str, sheet_name: str | None = None) -> pd.DataFrame:
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return pd.read_excel(BytesIO(r.content), sheet_name=(sheet_name if sheet_name else 0), engine="openpyxl")
 
-    raw_head = pd.read_excel(file_bytes, sheet_name=first_sheet, header=None, nrows=25)
+@st.cache_data(show_spinner=False)
+def load_xlsx_from_upload(file_bytes: bytes, sheet_name: str | None = None) -> pd.DataFrame:
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=(sheet_name if sheet_name else 0), engine="openpyxl")
 
-    saldo = None
-    header_row = 0
+def month_str(dt: date) -> str:
+    return f"{dt.year:04d}-{dt.month:02d}"
 
-    for idx, row in raw_head.iterrows():
-        row_str_lower = [str(x).lower().strip() for x in row.dropna().tolist()]
-
-        # saldo
-        if any("saldo" in val for val in row_str_lower) and saldo is None:
-            for val in row.dropna().tolist():
-                if isinstance(val, (int, float)):
-                    saldo = float(val)
-                    break
-                elif isinstance(val, str):
-                    tmp = parse_amount(pd.Series([val])).iloc[0]
-                    if not pd.isna(tmp):
-                        saldo = float(tmp)
-                        break
-
-        # header
-        if any("importo" in val for val in row_str_lower) and any("data" in val for val in row_str_lower):
-            header_row = idx
-            break
-
-    df = pd.read_excel(file_bytes, sheet_name=first_sheet, skiprows=header_row)
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed", case=False, na=False)]
-    return df, first_sheet, saldo
-
-def month_key(dt_series: pd.Series) -> pd.Series:
-    return dt_series.dt.to_period("M").astype(str)
+def month_add(ym: str, n: int) -> str:
+    y, m = map(int, ym.split("-"))
+    d0 = date(y, m, 1)
+    d1 = d0 + relativedelta(months=n)
+    return month_str(d1)
 
 # =========================
-# CATEGORIE (REGole forti)
+# Tipologie di SPESA (regole forti)
 # =========================
-CATEGORY_RULES = {
-    "Cibo": [
-        "bar", "rist", "pizz", "burger", "caff", "supermerc", "coop", "esselunga", "conad",
-        "carrefour", "glovo", "deliveroo", "justeat", "just eat", "pam", "lidl", "md"
-    ],
-    "Casa": [
-        "affitto", "condominio", "mutuo", "enel", "a2a", "iren", "hera", "tari",
-        "luce", "gas", "acqua", "internet", "fibra", "tim", "vodafone", "wind", "fastweb"
-    ],
-    "Auto/Trasporti": [
-        "benz", "diesel", "eni", "q8", "esso", "ip", "shell",
-        "autostr", "telepass", "tren", "tram", "metro", "taxi", "uber",
-        "italo", "trenitalia", "atm", "atac", "parchegg", "sosta"
-    ],
-    "Abbonamenti": [
-        "netflix", "spotify", "prime", "amazon prime", "disney", "abbon", "subscription",
-        "apple", "icloud", "google one"
-    ],
-    "Shopping": [
-        "amazon", "ikea", "zara", "h&m", "hm", "decathlon", "mediaworld", "unieuro",
-        "store", "negozio", "shopping"
-    ],
-    "Salute": [
-        "farm", "medic", "ticket", "dent", "osped", "clinic", "analisi", "visita", "sanit"
-    ],
-    "Svago": [
-        "cinema", "teatro", "concerto", "pub", "aperi", "discoteca", "evento", "museo"
-    ],
-    "Commissioni/Banca": [
-        "commission", "canone", "imposta", "bollo", "spese", "fee", "prelievo", "carta",
-        "interessi", "costi"
-    ],
-    "Viaggi": [
-        "hotel", "airbnb", "flight", "ryanair", "easyjet", "booking", "expedia", "noleggio",
-        "volo", "aeroporto", "traghetto"
-    ],
-}
+def categorize_spend_rule(desc: str) -> str | None:
+    if desc is None:
+        return None
+    d = str(desc).strip().lower()
 
-def tag_category_rules(desc: str, amount: float) -> str:
-    if amount is not None and amount > 0:
-        return "Entrate"
-    dl = (desc or "").lower()
-    for cat, keys in CATEGORY_RULES.items():
-        if any(k in dl for k in keys):
-            return cat
+    if any(k in d for k in ["movocchiali", "occhial", "ottica", "lenti", "visita", "studio medico", "medic", "dott", "clinica", "osped", "dent", "ticket", "farmac"]):
+        return "Salute"
+    if any(k in d for k in ["mova", "sushi"]):
+        return "Sushi"
+    if "netflix" in d:
+        return "Netflix"
+    if any(k in d for k in ["vodafone", "tim", "iliad", "wind", "fastweb"]):
+        return "Telefonia"
+    if any(k in d for k in ["chatgpt", "openai"]):
+        return "AI / ChatGPT"
+    if any(k in d for k in ["ticketone", "vivaticket", "ticketmaster"]):
+        return "Concerti / Eventi"
+    if any(k in d for k in ["booking", "airbnb", "trenitalia", "italo", "ryanair", "easyjet", "marino", "flixbus", "hotel", "volo"]):
+        return "Viaggi"
+    if any(k in d for k in ["zalando", "zara", "h&m", "hm", "decathlon", "piazza italia", "nike", "adidas"]):
+        return "Abbigliamento"
+    if any(k in d for k in ["mediaworld", "unieuro", "amazon", "apple", "huawei", "samsung", "iphone", "pc", "computer", "tablet"]):
+        return "Tecnologia"
+    if any(k in d for k in ["acqua e sapone", "acqua&sapone", "tigot", "dm", "detersiv", "sapone", "shampoo", "profumer"]):
+        return "Casa / Cura persona"
+    if any(k in d for k in ["coop", "conad", "esselunga", "carrefour", "lidl", "aldi", "super", "market", "ristor", "trattor", "oster", "pizzer", "bar", "gelat", "pescher", "maceller", "forno", "gastronom"]):
+        return "Cibo / Spesa / Ristoranti"
+    return None
+
+# =========================
+# Tipologie di PAGAMENTO (rule)
+# =========================
+def payment_type_rule(desc: str) -> str:
+    d = ("" if desc is None else str(desc)).strip().lower()
+
+    if any(k in d for k in ["preliev", "atm", "bancomat", "contanti"]):
+        return "Prelievo"
+    if any(k in d for k in ["bonifico", "giroconto", "sepa credit", "sepa trasfer"]):
+        return "Bonifico"
+    if any(k in d for k in ["sdd", "rid", "addebito diretto", "direct debit"]):
+        return "Addebito diretto"
+    if any(k in d for k in ["pagopa", "f24", "tribut", "impost", "tari"]):
+        return "PagoPA / Tributi"
+    if any(k in d for k in ["commission", "canone", "spese tenuta", "imposta di bollo", "bollo"]):
+        return "Commissioni / Canoni"
+    if any(k in d for k in ["pos", "carta", "pagamento", "mastercard", "visa"]):
+        return "Carta"
+    if any(k in d for k in ["srl", "spa", "ristor", "market", "super", "shop", "store", "amazon", "zalando", "vodafone", "netflix"]):
+        return "Carta"
     return "Altro"
 
 # =========================
-# PAGAMENTI (REGole + colonna se esiste)
+# Clustering opzionale + titoli cluster
 # =========================
-PAYMENT_RULES = {
-    "PagoPA-F24": ["pagopa", "f24", "f23", "rav", "mav"],
-    "Addebito diretto": ["sdd", "addebito", "rid", "direct debit", "domicilia"],
-    "Bonifico": ["bonifico", "giroconto", "sepa credit transfer", "sct"],
-    "Prelievo": ["preliev", "atm", "bancomat"],
-    "Commissioni": ["commission", "canone", "bollo", "spese", "fee", "interessi"],
-    "Carta": ["carta", "pos", "pagamento carta", "visa", "mastercard", "amex", "contactless"],
-}
+def pretty_cluster_title(top_terms: list[str]) -> str:
+    t = " ".join(top_terms).lower()
+    if any(k in t for k in ["sushi", "mova", "ristor", "pizzer", "bar", "trattor", "oster"]):
+        return "Ristorazione / Sushi"
+    if any(k in t for k in ["coop", "conad", "esselunga", "carrefour", "lidl", "aldi", "super", "market"]):
+        return "Spesa / Supermercato"
+    if any(k in t for k in ["vodafone", "tim", "iliad", "fastweb", "wind"]):
+        return "Telefonia"
+    if any(k in t for k in ["netflix", "spotify", "disney", "prime"]):
+        return "Streaming"
+    if any(k in t for k in ["ticketone", "vivaticket", "concert", "evento"]):
+        return "Concerti / Eventi"
+    if any(k in t for k in ["booking", "airbnb", "trenitalia", "italo", "ryanair", "easyjet", "marino", "flixbus", "hotel", "volo"]):
+        return "Viaggi"
+    if any(k in t for k in ["farmac", "medic", "dott", "visita", "ottica", "occhial", "lenti", "dent", "ticket"]):
+        return "Salute"
+    if any(k in t for k in ["zalando", "zara", "hm", "h&m", "decathlon", "nike", "adidas", "piazza"]):
+        return "Abbigliamento / Sport"
+    if any(k in t for k in ["mediaworld", "unieuro", "apple", "huawei", "samsung", "amazon", "pc", "iphone"]):
+        return "Tecnologia"
+    top = [x for x in top_terms if x][:3]
+    return "Altro – " + ", ".join(top) if top else "Altro"
 
-def tag_payment(desc: str, raw_payment: str | None) -> str:
-    # se c'è una colonna tipo "Metodo" o "Tipo operazione", proviamo a mapparla
-    if raw_payment:
-        rp = raw_payment.lower()
-        if any(k in rp for k in ["pagopa", "f24", "mav", "rav"]):
-            return "PagoPA-F24"
-        if any(k in rp for k in ["sdd", "addebito", "rid", "domicilia"]):
-            return "Addebito diretto"
-        if "bonific" in rp or "sct" in rp:
-            return "Bonifico"
-        if any(k in rp for k in ["preliev", "atm", "bancomat"]):
-            return "Prelievo"
-        if any(k in rp for k in ["commission", "canone", "bollo", "spese", "fee"]):
-            return "Commissioni"
-        if any(k in rp for k in ["carta", "pos", "visa", "mastercard", "amex"]):
-            return "Carta"
+def ai_cluster_unknowns_with_titles(unknown_desc: pd.Series, n_clusters: int = 6):
+    texts = unknown_desc.fillna("").astype(str).str.lower().str.strip()
+    texts = texts.str.replace(r"[^a-z0-9àèéìòù\s]", " ", regex=True)
+    texts = texts.str.replace(r"\s+", " ", regex=True)
 
-    dl = (desc or "").lower()
-    for ptype, keys in PAYMENT_RULES.items():
-        if any(k in dl for k in keys):
-            return ptype
-    return "Altro"
+    uniq = texts.unique()
+    if len(uniq) < 3:
+        labels = pd.Series(["Altro"] * len(texts), index=unknown_desc.index)
+        info = pd.DataFrame([{"cluster_id": 0, "title": "Altro", "top_terms": ""}])
+        return labels, info
 
-# =========================
-# CLUSTERING (sklearn opzionale) + TITOLI CLUSTER
-# =========================
-def build_tfidf(desc_list):
-    vect = TfidfVectorizer(min_df=1, max_features=6000, ngram_range=(1, 2))
-    X = vect.fit_transform(desc_list)
-    Xn = normalize(X)
-    return Xn, vect
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.cluster import KMeans
+    except Exception:
+        labels = pd.Series(["Altro"] * len(texts), index=unknown_desc.index)
+        info = pd.DataFrame([{"cluster_id": 0, "title": "Altro", "top_terms": "sklearn non installato"}])
+        return labels, info
 
-def kmeans_labels(Xn, desired_k=12):
-    n = Xn.shape[0]
-    if n < MIN_ROWS_FOR_CLUSTER:
-        return np.zeros(n, dtype=int)
-    k = int(np.clip(desired_k, 2, max(2, int(np.sqrt(n)))))
+    k = max(2, min(int(n_clusters), len(uniq)))
+    vect = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
+    X = vect.fit_transform(texts.tolist())
+
     km = KMeans(n_clusters=k, random_state=42, n_init=10)
-    return km.fit_predict(Xn), km
+    cluster_id = km.fit_predict(X)
 
-def cluster_titles_from_centroids(km, vect, topn=4):
-    # titoli usando top termini dei centroidi
-    feats = np.array(vect.get_feature_names_out())
-    centers = km.cluster_centers_
-    titles = {}
-    for i in range(centers.shape[0]):
-        idx = np.argsort(centers[i])[::-1][:topn]
-        words = feats[idx]
-        title = " / ".join([w for w in words if len(w) >= 3])
-        titles[i] = title if title else f"Cluster {i}"
-    return titles
+    feature_names = np.array(vect.get_feature_names_out())
+    centroids = km.cluster_centers_
+    topn = 6
 
-# =========================
-# FORECAST / SIMULAZIONE
-# =========================
-def monthly_aggregate(df, date_col, amt_col):
-    tmp = df[df[date_col].notna()].copy()
-    tmp["_ym"] = month_key(tmp[date_col])
-    m = tmp.groupby("_ym")[amt_col].sum().reset_index().rename(columns={amt_col: "net"})
-    return m
-
-def month_components(df):
-    """
-    Crea serie mensili entrate/uscite/netto e una stima stagionalità entrate per mese dell'anno.
-    """
-    tmp = df[df["_date"].notna()].copy()
-    tmp["_ym"] = month_key(tmp["_date"])
-    tmp["_y"] = tmp["_date"].dt.year
-    tmp["_m"] = tmp["_date"].dt.month
-
-    inflow = tmp[tmp["_amount"] > 0].groupby("_ym")["_amount"].sum()
-    outflow = tmp[tmp["_amount"] < 0].groupby("_ym")["_amount"].sum()  # negativo
-    net = tmp.groupby("_ym")["_amount"].sum()
-
-    mdf = pd.DataFrame({
-        "_ym": sorted(set(tmp["_ym"].unique())),
-    })
-    mdf["entrate"] = mdf["_ym"].map(inflow).fillna(0.0)
-    mdf["uscite"] = mdf["_ym"].map(outflow).fillna(0.0)
-    mdf["netto"] = mdf["_ym"].map(net).fillna(0.0)
-
-    # per trend: indice temporale 0..n-1
-    mdf["t"] = np.arange(len(mdf))
-
-    # stagionalità entrate per mese dell'anno
-    # calcoliamo mean entrate per mese (1..12)
-    tmp_m = tmp.copy()
-    tmp_m["entrate_pos"] = np.where(tmp_m["_amount"] > 0, tmp_m["_amount"], 0.0)
-    seas = tmp_m.groupby(tmp_m["_date"].dt.month)["entrate_pos"].sum()  # somma mensile per month-of-year aggregata su tutto lo storico
-    # normalizzo: fattore rispetto alla media
-    mean_monthly_income = mdf["entrate"].mean() if len(mdf) else 0.0
-    if mean_monthly_income > 0:
-        season_factor = (seas / seas.mean()).to_dict()
-    else:
-        season_factor = {i: 1.0 for i in range(1, 13)}
-
-    return mdf, season_factor
-
-def simulate_balance(
-    start_balance: float,
-    start_next_month: pd.Timestamp,
-    target_balance: float,
-    max_monthly_spend_abs: float,
-    mdf_hist: pd.DataFrame,
-    season_factor: dict,
-    use_trend: bool = True,
-    use_seasonality: bool = True,
-    horizon_months: int = 60
-):
-    """
-    Simula mese per mese:
-    entrate = trend (su storico) * stagionalità (opzionale)
-    uscite = -min(max_spesa, |media uscite storico|)
-    """
-    if len(mdf_hist) < 2:
-        return pd.DataFrame()
-
-    # Trend entrate su storico
-    base_income = float(mdf_hist["entrate"].mean())
-    if SKLEARN_OK and use_trend:
-        X = mdf_hist[["t"]].values
-        y = mdf_hist["entrate"].values
-        lr = LinearRegression()
-        lr.fit(X, y)
-        income_pred_fn = lambda t: float(lr.predict(np.array([[t]]))[0])
-    else:
-        income_pred_fn = lambda t: base_income
-
-    # baseline uscite: media valore assoluto uscite (negativo)
-    avg_spend_abs = float((-mdf_hist["uscite"]).mean())
-    spend_abs = min(max_monthly_spend_abs, avg_spend_abs) if avg_spend_abs > 0 else max_monthly_spend_abs
-
+    cluster_titles = {}
     rows = []
-    bal = float(start_balance)
+    for cid in range(k):
+        top_idx = np.argsort(centroids[cid])[::-1][:topn]
+        top_terms = feature_names[top_idx].tolist()
+        title = pretty_cluster_title(top_terms)
+        cluster_titles[cid] = title
+        rows.append({"cluster_id": cid, "title": title, "top_terms": ", ".join(top_terms)})
 
-    # indice t futuro continua dallo storico
-    t0 = int(mdf_hist["t"].max()) + 1
-
-    current = pd.Timestamp(start_next_month).replace(day=1)
-    for i in range(horizon_months):
-        t = t0 + i
-        inc = max(0.0, income_pred_fn(t))
-        if use_seasonality:
-            inc *= float(season_factor.get(int(current.month), 1.0))
-
-        out = -float(spend_abs)  # negativo
-        net = inc + out
-        bal = bal + net
-
-        rows.append({
-            "mese": current.strftime("%Y-%m"),
-            "entrate_sim": inc,
-            "uscite_sim": out,
-            "netto_sim": net,
-            "saldo_sim": bal
-        })
-
-        if bal >= target_balance:
-            break
-
-        current = (current + pd.offsets.MonthBegin(1)).replace(day=1)
-
-    return pd.DataFrame(rows)
+    labels = pd.Series([cluster_titles[int(c)] for c in cluster_id], index=unknown_desc.index)
+    info = pd.DataFrame(rows).sort_values("cluster_id")
+    return labels, info
 
 # =========================
-# UI INPUT
+# Forecast entrate “shape”
 # =========================
-st.sidebar.header("⚙️ Impostazioni")
+def forecast_with_shape(series: pd.Series, months: pd.Series, horizon: int) -> list[float]:
+    df = pd.DataFrame({"month": months.astype(str), "y": series.astype(float)})
+    df["dt"] = pd.to_datetime(df["month"] + "-01", errors="coerce")
+    df = df.dropna(subset=["dt", "y"]).sort_values("dt")
 
-enable_cluster = st.sidebar.toggle("Clustering 'AI' leggero (sklearn)", value=True)
-if enable_cluster and not SKLEARN_OK:
-    st.sidebar.warning("scikit-learn non disponibile: clustering disattivato.")
-    enable_cluster = False
+    if len(df) < 3:
+        base = float(df["y"].iloc[-1]) if len(df) else 0.0
+        return [base for _ in range(horizon)]
 
-k_clusters = st.sidebar.slider("Numero indicativo cluster", 4, 24, 12, 1) if enable_cluster else 0
-ma_window = st.sidebar.slider("Finestra medie mobili (mesi)", 2, 6, 3, 1)
+    df["t"] = np.arange(len(df)).astype(float)
+    a, b = np.polyfit(df["t"].values, df["y"].values, 1)
+    df["trend"] = a * df["t"] + b
+    df["trend"] = df["trend"].replace(0, np.nan)
 
-debug = st.sidebar.toggle("🔎 Debug (min/max importi)", value=False)
+    df["moy"] = df["dt"].dt.month
+    df["ratio"] = (df["y"] / df["trend"]).replace([np.inf, -np.inf], np.nan)
+    season = df.groupby("moy")["ratio"].mean().fillna(1.0)
+    if season.isna().all():
+        season = pd.Series({m: 1.0 for m in range(1, 13)})
 
-st.sidebar.divider()
-st.sidebar.subheader("🎯 Simulazione saldo target")
+    last_dt = df["dt"].iloc[-1]
+    last_t = df["t"].iloc[-1]
 
-target_balance = st.sidebar.number_input("Saldo target (€)", value=5000.0, step=100.0)
-max_spend = st.sidebar.number_input("Spesa massima mensile (assoluto, €)", value=1200.0, step=50.0, min_value=0.0)
-use_trend = st.sidebar.toggle("Usa trend entrate", value=True)
-use_seasonality = st.sidebar.toggle("Usa stagionalità entrate", value=True)
-horizon = st.sidebar.slider("Orizzonte massimo (mesi)", 6, 120, 60, 6)
+    preds = []
+    for i in range(1, horizon + 1):
+        dt_f = last_dt + relativedelta(months=i)
+        t_f = last_t + i
+        trend_f = a * t_f + b
+        s_f = float(season.get(dt_f.month, float(season.mean())))
+        preds.append(max(0.0, float(trend_f) * s_f))
+    return preds
+
 
 # =========================
-# LOAD DATA
+# MAIN UI: Fonte dati (upload o URL)
 # =========================
-uploaded = st.file_uploader("Carica Excel (movimenti nel primo foglio)", type=["xlsx", "xls"])
-if not uploaded:
-    st.stop()
+st.title("🏦 Bank Spend Analytics")
 
+st.sidebar.header("📥 Fonte dati")
+uploaded = st.sidebar.file_uploader(
+    "Trascina qui l'Excel (drag & drop)",
+    type=["xlsx", "xls"],
+    help="Se carichi un file, verrà usato questo. Altrimenti usa XLSX_URL dai secrets."
+)
+
+sec = safe_secrets()
+xlsx_url = (sec.get("XLSX_URL") or "").strip()
+sheet_name = (sec.get("SHEET_NAME") or "").strip()
+
+use_url = False
+if uploaded is None:
+    if xlsx_url:
+        use_url = True
+        st.sidebar.caption("Nessun file caricato: uso XLSX_URL da secrets.")
+    else:
+        st.error("Carica un file Excel (drag & drop) oppure configura XLSX_URL nei secrets.")
+        st.stop()
+else:
+    st.sidebar.caption("File caricato: uso upload (priorità su XLSX_URL).")
+
+# carica dati
 try:
-    df, sheet_name, saldo_value = load_first_sheet(uploaded.getvalue())
+    if uploaded is not None:
+        raw = load_xlsx_from_upload(uploaded.getvalue(), sheet_name if sheet_name else None)
+    else:
+        raw = load_xlsx_from_url(xlsx_url, sheet_name if sheet_name else None)
 except Exception as e:
-    st.error(f"Errore lettura Excel: {e}")
+    st.error(f"Errore caricamento Excel: {e}")
     st.stop()
 
-# colonne principali
-c_date = infer_col(df, ["data", "date"])
-c_desc = infer_col(df, ["descrizione", "description", "causale", "dettaglio", "merchant", "nome", "desc"])
-c_amt  = infer_col(df, ["importo", "amount", "valore", "movimento", "€", "eur"])
-
-# colonna pagamento (se esiste)
-c_pay = infer_col(df, ["pagamento", "payment", "metodo", "strumento", "tipo operazione", "operazione", "canale"])
-
-if c_desc is None or c_amt is None:
-    st.error(f"Non trovo le colonne chiave (Descrizione/Importo). Colonne: {list(df.columns)}")
+# validazione colonne
+cols_norm = normalize_col_lookup(raw.columns)
+need = [COL_DATE, COL_DESC, COL_AMOUNT]
+missing = [c for c in need if c.strip().lower() not in cols_norm]
+if missing:
+    st.error(f"Mancano colonne nel file: {missing}\nColonne trovate: {list(raw.columns)}")
     st.stop()
 
-out = df.copy()
-out["_amount"] = parse_amount(out[c_amt])
-out = out.dropna(subset=["_amount"])
+col_date = cols_norm[COL_DATE.lower()]
+col_desc = cols_norm[COL_DESC.lower()]
+col_amount = cols_norm[COL_AMOUNT.lower()]
 
-if c_date is not None:
-    out["_date"] = pd.to_datetime(out[c_date], errors="coerce", dayfirst=True)
-else:
-    out["_date"] = pd.NaT
+# prepara df
+df = raw.copy()
+df["date"] = parse_date(df[col_date])
+df["amount"] = parse_amount(df[col_amount])
+df["description"] = df[col_desc].astype(str).str.strip()
 
-out["_desc"] = out[c_desc].astype(str).map(norm_text)
-out["_pay_raw"] = out[c_pay].astype(str).map(norm_text) if c_pay is not None else None
+df = df.dropna(subset=["date", "amount"]).copy()
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values("date").reset_index(drop=True)
 
-if debug and len(out):
-    st.sidebar.write("Min importo:", float(out["_amount"].min()))
-    st.sidebar.write("Max importo:", float(out["_amount"].max()))
-    st.sidebar.write("Esempi:", out["_amount"].head(8).tolist())
+min_d = df["date"].min().date()
+max_d = df["date"].max().date()
 
-# =========================
-# CATEGORIE + CLUSTER (opzionale) + TITOLI
-# =========================
-out["_category_rule"] = [tag_category_rules(d, a) for d, a in zip(out["_desc"], out["_amount"])]
+# TOP: periodo + saldo
+topA, topB = st.columns([2, 1])
+with topA:
+    period = st.date_input(
+        "Periodo analisi (da–a)",
+        value=(min_d, max_d),
+        min_value=min_d,
+        max_value=max_d,
+    )
+    d_from, d_to = period if isinstance(period, tuple) else (min_d, max_d)
+with topB:
+    current_balance = st.number_input("Saldo contabile attuale (€) (manuale)", value=21039.34, step=100.0)
 
-# clustering su descrizioni (serve anche per titoli cluster pertinenti)
-if enable_cluster:
-    desc_list = out["_desc"].tolist()
-    Xn, vect = build_tfidf(desc_list)
-    labels, km = kmeans_labels(Xn, desired_k=k_clusters)
-    out["_cluster"] = labels
+dfp = df[(df["date"].dt.date >= d_from) & (df["date"].dt.date <= d_to)].copy()
+if dfp.empty:
+    st.warning("Nel periodo selezionato non ci sono movimenti.")
+    st.stop()
 
-    titles = cluster_titles_from_centroids(km, vect, topn=4)
-    out["_cluster_title"] = out["_cluster"].map(titles)
-else:
-    out["_cluster"] = 0
-    out["_cluster_title"] = "Cluster unico"
+dfp["month"] = dfp["date"].dt.to_period("M").astype(str)
 
-# categoria finale:
-# - se regola != Altro => regola
-# - se Altro => “Altro: <titolo cluster>” (così hai sub-categorie coerenti)
-out["_category"] = np.where(
-    out["_category_rule"] == "Altro",
-    "Altro: " + out["_cluster_title"].astype(str),
-    out["_category_rule"]
-)
+# Monthly aggregates
+m = dfp.groupby("month", as_index=False).agg(
+    income=("amount", lambda s: s[s > 0].sum()),
+    expense=("amount", lambda s: -s[s < 0].sum()),  # positivo
+    net=("amount", "sum"),
+    n_tx=("amount", "size"),
+).sort_values("month").reset_index(drop=True)
 
-# =========================
-# PAYMENT TYPES
-# =========================
-if c_pay is not None:
-    pay_list = out["_pay_raw"].tolist()
-else:
-    pay_list = [None] * len(out)
+income_total = dfp.loc[dfp["amount"] > 0, "amount"].sum()
+expense_total = -dfp.loc[dfp["amount"] < 0, "amount"].sum()
+net_total = income_total - expense_total
 
-out["_payment_type"] = [
-    tag_payment(d, p) for d, p in zip(out["_desc"], pay_list)
-]
+avg_income_month = float(m["income"].mean()) if len(m) else 0.0
+avg_expense_month = float(m["expense"].mean()) if len(m) else 0.0
+avg_net_month = float(m["net"].mean()) if len(m) else 0.0
 
-# =========================
 # KPI
-# =========================
-tot_spese = out.loc[out["_amount"] < 0, "_amount"].sum()
-tot_entrate = out.loc[out["_amount"] > 0, "_amount"].sum()
-netto = out["_amount"].sum()
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Saldo attuale", f"€ {float(current_balance):,.2f}", "manuale")
+k2.metric("Entrate (periodo)", f"€ {float(income_total):,.2f}")
+k3.metric("Uscite (periodo)", f"€ {float(expense_total):,.2f}")
+k4.metric("Netto (periodo)", f"€ {float(net_total):,.2f}")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Saldo (estratto)", f"{saldo_value:,.2f} €" if saldo_value is not None else "N/D")
-c2.metric("Entrate (periodo)", f"{tot_entrate:,.2f} €")
-c3.metric("Uscite (periodo)", f"{tot_spese:,.2f} €")
-c4.metric("Netto (periodo)", f"{netto:,.2f} €")
+a1, a2, a3 = st.columns(3)
+a1.metric("Entrate medie mensili", f"€ {avg_income_month:,.2f}")
+a2.metric("Uscite medie mensili", f"€ {avg_expense_month:,.2f}")
+a3.metric("Netto medio mensile", f"€ {avg_net_month:,.2f}")
 
-st.caption(f"Foglio letto: {sheet_name} | Clustering: {'ON' if enable_cluster else 'OFF'} | sklearn: {'OK' if SKLEARN_OK else 'NO'}")
-st.divider()
+st.markdown("---")
 
 # =========================
-# 1) GRAFICO CUMULATA PERIODO (PRIMO)
+# 1) CUMULATA
 # =========================
-st.subheader("✅ Cumulata del periodo (saldo relativo ai movimenti)")
-if out["_date"].notna().any():
-    tmp = out.dropna(subset=["_date"]).sort_values("_date")
-    tmp["_cum"] = tmp["_amount"].cumsum()
-    fig_cum = px.line(tmp, x="_date", y="_cum")
-    fig_cum.update_layout(xaxis_title="Data", yaxis_title="Cumulata movimenti (€)")
-    st.plotly_chart(fig_cum, use_container_width=True)
+st.subheader("Cumulata saldo nel periodo (da movimenti)")
+
+saldo_iniziale_stimato = float(current_balance) - float(m["net"].sum())
+use_manual_start = st.checkbox("Imposta manualmente saldo iniziale del periodo", value=False)
+if use_manual_start:
+    saldo_iniziale = st.number_input("Saldo iniziale periodo (€)", value=saldo_iniziale_stimato, step=100.0)
 else:
-    st.info("Colonna Data non disponibile: cumulata non mostrabile.")
+    saldo_iniziale = saldo_iniziale_stimato
+
+cum = m.copy()
+cum["saldo_cumulato"] = float(saldo_iniziale) + cum["net"].cumsum()
+
+fig_cum = go.Figure()
+fig_cum.add_trace(go.Scatter(
+    x=cum["month"], y=cum["saldo_cumulato"],
+    mode="lines+markers",
+    name="Saldo cumulato",
+    line=dict(color=NET_ORANGE, width=3)
+))
+fig_cum.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+st.plotly_chart(fig_cum, use_container_width=True)
+
+st.markdown("---")
 
 # =========================
-# 2) ENTRATE / USCITE / NETTO (mensile)
+# 2) ENTRATE/USCITE/NETTO
 # =========================
-st.subheader("✅ Entrate / Uscite / Netto (mensile)")
-if out["_date"].notna().any():
-    tmp = out.dropna(subset=["_date"]).copy()
-    tmp["_ym"] = month_key(tmp["_date"])
+st.subheader("Entrate / Uscite mensili + Netto")
+fig = go.Figure()
+fig.add_trace(go.Bar(x=m["month"], y=m["income"], name="Entrate"))
+fig.add_trace(go.Bar(x=m["month"], y=m["expense"], name="Uscite"))
+fig.add_trace(go.Scatter(
+    x=m["month"], y=m["net"],
+    mode="lines+markers",
+    name="Netto",
+    line=dict(color=NET_ORANGE, width=3)
+))
+fig.update_layout(barmode="group", margin=dict(l=10, r=10, t=30, b=10))
+st.plotly_chart(fig, use_container_width=True)
 
-    m_in = tmp[tmp["_amount"] > 0].groupby("_ym")["_amount"].sum()
-    m_out = tmp[tmp["_amount"] < 0].groupby("_ym")["_amount"].sum()  # negativo
-    m_net = tmp.groupby("_ym")["_amount"].sum()
+# =========================
+# 3) MEDIE MOBILI
+# =========================
+st.markdown("---")
+st.subheader("Entrate/Uscite medie: come cambiano nei mesi (media mobile)")
 
-    months = sorted(tmp["_ym"].unique())
-    mdf = pd.DataFrame({"Mese": months})
-    mdf["Entrate"] = mdf["Mese"].map(m_in).fillna(0.0)
-    mdf["Uscite"] = mdf["Mese"].map(m_out).fillna(0.0)
-    mdf["Netto"] = mdf["Mese"].map(m_net).fillna(0.0)
+win = st.selectbox("Finestra media mobile (mesi)", [1, 3, 6, 12], index=1)
+mm = m.copy()
+mm["income_ma"] = mm["income"].rolling(window=win, min_periods=1).mean()
+mm["expense_ma"] = mm["expense"].rolling(window=win, min_periods=1).mean()
 
-    # grafico grouped bar
-    fig_eun = go.Figure()
-    fig_eun.add_trace(go.Bar(name="Entrate", x=mdf["Mese"], y=mdf["Entrate"]))
-    fig_eun.add_trace(go.Bar(name="Uscite", x=mdf["Mese"], y=mdf["Uscite"]))
-    fig_eun.add_trace(go.Bar(name="Netto", x=mdf["Mese"], y=mdf["Netto"]))
-    fig_eun.update_layout(barmode="group", xaxis_title="Mese", yaxis_title="€")
-    st.plotly_chart(fig_eun, use_container_width=True)
+fig_ma = go.Figure()
+fig_ma.add_trace(go.Scatter(x=mm["month"], y=mm["income_ma"], mode="lines+markers", name=f"Entrate medie ({win}m)"))
+fig_ma.add_trace(go.Scatter(x=mm["month"], y=mm["expense_ma"], mode="lines+markers", name=f"Uscite medie ({win}m)"))
+fig_ma.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+st.plotly_chart(fig_ma, use_container_width=True)
+
+st.markdown("---")
+
+# =========================
+# TIPI DI PAGAMENTO
+# =========================
+st.subheader("Tipologie di pagamento")
+
+dfp["payment_type"] = dfp["description"].apply(payment_type_rule)
+
+pay = dfp[dfp["amount"] < 0].copy()
+if pay.empty:
+    st.info("Nessuna uscita nel periodo per tipologie di pagamento.")
 else:
-    st.info("Colonna Data non disponibile: vista mensile non mostrabile.")
+    pay["expense_abs"] = -pay["amount"]
+    pay_tot = pay.groupby("payment_type", as_index=False)["expense_abs"].sum().sort_values("expense_abs", ascending=False)
+
+    cL, cR = st.columns([2, 1])
+    with cL:
+        fig_pay = go.Figure()
+        fig_pay.add_trace(go.Bar(x=pay_tot["expense_abs"], y=pay_tot["payment_type"], orientation="h", name="Spesa"))
+        fig_pay.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig_pay, use_container_width=True)
+    with cR:
+        t = pay_tot.copy()
+        t["Spesa (€)"] = t["expense_abs"].round(2)
+        t = t.drop(columns=["expense_abs"])
+        st.dataframe(t, use_container_width=True, hide_index=True)
+
+    st.subheader("Uscite mensili per tipologia di pagamento")
+    pay_month = pay.groupby(["month", "payment_type"], as_index=False)["expense_abs"].sum()
+    pay_piv = pay_month.pivot(index="month", columns="payment_type", values="expense_abs").fillna(0.0)
+
+    fig_pay_stack = go.Figure()
+    for c in pay_piv.columns:
+        fig_pay_stack.add_trace(go.Bar(x=pay_piv.index, y=pay_piv[c], name=str(c)))
+    fig_pay_stack.update_layout(barmode="stack", margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig_pay_stack, use_container_width=True)
+
+st.markdown("---")
 
 # =========================
-# 3) MEDIE MOBILI (entrate + uscite)
+# SPESE per CATEGORIA (regole + clustering opzionale)
 # =========================
-st.subheader("✅ Medie mobili (entrate + uscite) — mese per mese")
-if out["_date"].notna().any():
-    tmp = out.dropna(subset=["_date"]).copy()
-    tmp["_ym"] = month_key(tmp["_date"])
+st.subheader("Spese per tipologia (categorie)")
 
-    m_in = tmp[tmp["_amount"] > 0].groupby("_ym")["_amount"].sum()
-    m_out_abs = tmp[tmp["_amount"] < 0].groupby("_ym")["_amount"].sum().abs()
-
-    months = sorted(tmp["_ym"].unique())
-    mdf = pd.DataFrame({"Mese": months})
-    mdf["Entrate"] = mdf["Mese"].map(m_in).fillna(0.0)
-    mdf["Uscite"] = mdf["Mese"].map(m_out_abs).fillna(0.0)
-
-    mdf[f"MA{ma_window}_Entrate"] = mdf["Entrate"].rolling(ma_window).mean()
-    mdf[f"MA{ma_window}_Uscite"] = mdf["Uscite"].rolling(ma_window).mean()
-
-    fig_ma = go.Figure()
-    fig_ma.add_trace(go.Scatter(name="Entrate", x=mdf["Mese"], y=mdf["Entrate"], mode="lines+markers"))
-    fig_ma.add_trace(go.Scatter(name="Uscite", x=mdf["Mese"], y=mdf["Uscite"], mode="lines+markers"))
-    fig_ma.add_trace(go.Scatter(name=f"MA{ma_window} Entrate", x=mdf["Mese"], y=mdf[f"MA{ma_window}_Entrate"], mode="lines"))
-    fig_ma.add_trace(go.Scatter(name=f"MA{ma_window} Uscite", x=mdf["Mese"], y=mdf[f"MA{ma_window}_Uscite"], mode="lines"))
-    fig_ma.update_layout(xaxis_title="Mese", yaxis_title="€")
-    st.plotly_chart(fig_ma, use_container_width=True)
+sp = dfp[dfp["amount"] < 0].copy()
+if sp.empty:
+    st.info("Nessuna spesa nel periodo.")
 else:
-    st.info("Colonna Data non disponibile: medie mobili non mostrabili.")
+    sp["expense_abs"] = -sp["amount"]
+    sp["category"] = sp["description"].apply(categorize_spend_rule)
 
-st.divider()
+    unknown_mask = sp["category"].isna()
+    cluster_info = None
+    if unknown_mask.any():
+        labels, cluster_info = ai_cluster_unknowns_with_titles(sp.loc[unknown_mask, "description"], n_clusters=6)
+        sp.loc[unknown_mask, "category"] = labels
 
-# =========================
-# 4) TIPOLOGIE DI SPESA (categorie): grafico + tabella + stacked mensile + totale periodo
-# =========================
-st.subheader("✅ Tipologie di spesa (categorie): regole forti + clustering leggero + titoli cluster")
+    cat_total = (
+        sp.groupby("category", as_index=False)["expense_abs"]
+        .sum()
+        .sort_values("expense_abs", ascending=False)
+        .reset_index(drop=True)
+    )
 
-spese = out[out["_amount"] < 0].copy()
-if len(spese) == 0:
-    st.info("Nessuna uscita trovata nel periodo.")
-else:
-    # totale periodo per categoria
-    by_cat = spese.groupby("_category")["_amount"].sum().abs().sort_values(ascending=False).reset_index()
-    by_cat.columns = ["Categoria", "Totale (€)"]
-
-    cA, cB = st.columns([1.1, 0.9])
-
-    with cA:
-        fig_cat = px.bar(by_cat.head(20), x="Categoria", y="Totale (€)")
-        fig_cat.update_layout(xaxis_title="Categoria", yaxis_title="Spesa totale (€)")
+    left, right = st.columns([2, 1])
+    with left:
+        fig_cat = go.Figure()
+        fig_cat.add_trace(go.Bar(x=cat_total["expense_abs"], y=cat_total["category"], orientation="h", name="Spesa"))
+        fig_cat.update_layout(margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_cat, use_container_width=True)
+    with right:
+        t = cat_total.copy()
+        t["Spesa (€)"] = t["expense_abs"].round(2)
+        t = t.drop(columns=["expense_abs"])
+        st.dataframe(t, use_container_width=True, hide_index=True)
 
-    with cB:
-        st.markdown("**Tabella decrescente (top 30)**")
-        st.dataframe(by_cat.head(30), use_container_width=True)
+    if cluster_info is not None:
+        with st.expander("Debug cluster (titoli + top termini)"):
+            st.dataframe(cluster_info, use_container_width=True, hide_index=True)
 
-    # stacked mensile per categoria
-    st.markdown("**Stacked mensile per categoria**")
-    if spese["_date"].notna().any():
-        sp = spese.dropna(subset=["_date"]).copy()
-        sp["_ym"] = month_key(sp["_date"])
-        pivot_cat = (
-            sp.pivot_table(index="_ym", columns="_category", values="_amount", aggfunc="sum")
-            .fillna(0.0)
-            .abs()
-        )
-        pivot_cat = pivot_cat.loc[sorted(pivot_cat.index)]
+    st.subheader("Uscite mensili per categoria (stacked)")
+    cat_month = sp.groupby(["month", "category"], as_index=False)["expense_abs"].sum()
+    piv = cat_month.pivot(index="month", columns="category", values="expense_abs").fillna(0.0)
 
-        fig_stack_cat = go.Figure()
-        for col in pivot_cat.columns:
-            fig_stack_cat.add_trace(go.Bar(name=str(col), x=pivot_cat.index, y=pivot_cat[col]))
-        fig_stack_cat.update_layout(barmode="stack", xaxis_title="Mese", yaxis_title="Spesa (€)")
-        st.plotly_chart(fig_stack_cat, use_container_width=True)
-    else:
-        st.info("Colonna Data non disponibile: stacked mensile per categoria non mostrabile.")
+    fig_stack = go.Figure()
+    for c in piv.columns:
+        fig_stack.add_trace(go.Bar(x=piv.index, y=piv[c], name=str(c)))
+    fig_stack.update_layout(barmode="stack", margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig_stack, use_container_width=True)
 
-st.divider()
+    st.subheader("Totale periodo per categoria")
+    fig_total = go.Figure()
+    fig_total.add_trace(go.Bar(x=cat_total["expense_abs"], y=cat_total["category"], orientation="h"))
+    fig_total.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig_total, use_container_width=True)
+
+st.markdown("---")
 
 # =========================
-# 5) TIPOLOGIE DI PAGAMENTO: totale periodo + stacked mensile
+# SIMULAZIONE: target saldo con shape storico entrate
 # =========================
-st.subheader("✅ Tipologie di pagamento (Carta / Bonifico / Addebito diretto / Prelievo / PagoPA-F24 / Commissioni / Altro)")
+st.subheader("Simulazione: mese di raggiungimento saldo target (forecast con shape da storico)")
 
-# totale periodo per tipologia pagamento (su tutto: entrate+uscite; se vuoi solo spese, filtra qui)
-by_pay = out.groupby("_payment_type")["_amount"].sum().abs().sort_values(ascending=False).reset_index()
-by_pay.columns = ["Tipologia pagamento", "Totale (€)"]
+simA, simB, simC = st.columns(3)
+with simA:
+    target_balance = st.number_input("Target saldo (€)", value=25000.0, step=100.0)
+with simB:
+    max_monthly_expense = st.number_input("Spesa max mensile (€)", value=1500.0, step=50.0)
+with simC:
+    horizon = st.selectbox("Orizzonte max (mesi)", [12, 24, 36, 48, 60], index=2)
 
-cP1, cP2 = st.columns([1.1, 0.9])
+last_month = m["month"].iloc[-1]
+months_future = [month_add(last_month, i) for i in range(1, int(horizon) + 1)]
 
-with cP1:
-    fig_pay = px.bar(by_pay, x="Tipologia pagamento", y="Totale (€)")
-    fig_pay.update_layout(xaxis_title="Tipologia pagamento", yaxis_title="Totale (€)")
-    st.plotly_chart(fig_pay, use_container_width=True)
+income_fc = forecast_with_shape(m["income"], m["month"], horizon=int(horizon))
 
-with cP2:
-    st.markdown("**Tabella decrescente**")
-    st.dataframe(by_pay, use_container_width=True)
+balances = []
+bal = float(current_balance)
+reach_month = None
 
-st.markdown("**Stacked mensile per tipologia pagamento**")
-if out["_date"].notna().any():
-    tmp = out.dropna(subset=["_date"]).copy()
-    tmp["_ym"] = month_key(tmp["_date"])
-    pivot_pay = (
-        tmp.pivot_table(index="_ym", columns="_payment_type", values="_amount", aggfunc="sum")
-        .fillna(0.0)
-        .abs()
-    )
-    pivot_pay = pivot_pay.loc[sorted(pivot_pay.index)]
+for i, ym in enumerate(months_future):
+    inc = float(income_fc[i])
+    exp = float(max_monthly_expense)
+    netm = inc - exp
+    bal = bal + netm
+    balances.append((ym, inc, exp, netm, bal))
+    if reach_month is None and bal >= float(target_balance):
+        reach_month = ym
 
-    fig_stack_pay = go.Figure()
-    for col in pivot_pay.columns:
-        fig_stack_pay.add_trace(go.Bar(name=str(col), x=pivot_pay.index, y=pivot_pay[col]))
-    fig_stack_pay.update_layout(barmode="stack", xaxis_title="Mese", yaxis_title="Totale (€)")
-    st.plotly_chart(fig_stack_pay, use_container_width=True)
+sim_df = pd.DataFrame(balances, columns=["month", "income_fc", "expense_cap", "net_fc", "balance_fc"])
+
+if reach_month is None:
+    st.warning(f"Non raggiungi € {float(target_balance):,.2f} entro {horizon} mesi (entrate forecast con shape storico, spesa cap impostata).")
 else:
-    st.info("Colonna Data non disponibile: stacked mensile per tipologia pagamento non mostrabile.")
+    y, mo = map(int, reach_month.split("-"))
+    st.success(f"Target € {float(target_balance):,.2f} raggiunto in **{datetime(y, mo, 1).strftime('%B %Y')}** (simulazione).")
 
-st.divider()
+fig_sim = go.Figure()
+fig_sim.add_trace(go.Scatter(
+    x=sim_df["month"], y=sim_df["balance_fc"],
+    mode="lines+markers",
+    name="Saldo simulato",
+    line=dict(color=NET_ORANGE, width=3)
+))
+fig_sim.add_hline(y=float(target_balance), line_dash="dash", annotation_text="Target", annotation_position="top left")
+fig_sim.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+st.plotly_chart(fig_sim, use_container_width=True)
 
-# =========================
-# 6) SIMULAZIONE: mese raggiungimento saldo target (trend + stagionalità entrate) + spesa max
-# =========================
-st.subheader("✅ Simulazione: mese di raggiungimento saldo target")
+with st.expander("Dettaglio simulazione"):
+    tmp = sim_df.copy()
+    for c in ["income_fc", "expense_cap", "net_fc", "balance_fc"]:
+        tmp[c] = tmp[c].round(2)
+    st.dataframe(tmp, use_container_width=True, hide_index=True)
 
-if not out["_date"].notna().any():
-    st.info("Serve la colonna Data per stimare trend/stagionalità e fare la simulazione.")
-else:
-    # storico mensile + stagionalità
-    mdf_hist, seas = month_components(out)
+st.markdown("---")
 
-    # saldo iniziale: usa saldo estratto se presente, altrimenti saldo relativo dei movimenti
-    if saldo_value is not None and not pd.isna(saldo_value):
-        start_balance = float(saldo_value)
-        start_note = "Saldo iniziale = saldo estratto (trovato nel file)"
-    else:
-        # fallback: cumulata dei movimenti termina su un saldo relativo
-        tmp = out.dropna(subset=["_date"]).sort_values("_date")
-        start_balance = float(tmp["_amount"].cumsum().iloc[-1]) if len(tmp) else 0.0
-        start_note = "Saldo iniziale = cumulata movimenti (fallback: saldo estratto non trovato)"
-
-    # partenza dal prossimo mese rispetto all'ultima data in storico
-    last_date = out.dropna(subset=["_date"])["_date"].max()
-    next_month = (pd.Timestamp(last_date) + pd.offsets.MonthBegin(1)).replace(day=1)
-
-    sim = simulate_balance(
-        start_balance=start_balance,
-        start_next_month=next_month,
-        target_balance=float(target_balance),
-        max_monthly_spend_abs=float(max_spend),
-        mdf_hist=mdf_hist,
-        season_factor=seas,
-        use_trend=bool(use_trend),
-        use_seasonality=bool(use_seasonality),
-        horizon_months=int(horizon),
+with st.expander("Movimenti filtrati (debug)"):
+    st.dataframe(
+        dfp[["date", "month", "description", "amount", "payment_type"]].sort_values("date", ascending=False),
+        use_container_width=True,
+        hide_index=True
     )
-
-    st.caption(start_note)
-    st.caption(f"Partenza simulazione: {next_month.strftime('%Y-%m')} | Orizzonte max: {horizon} mesi")
-
-    if sim.empty:
-        st.warning("Storico insufficiente per stimare la simulazione (servono almeno 2 mesi con date).")
-    else:
-        # esito
-        reached = sim["saldo_sim"].iloc[-1] >= float(target_balance)
-        if reached:
-            st.success(f"Target raggiunto in: {sim['mese'].iloc[-1]}")
-        else:
-            st.warning(f"Target NON raggiunto entro {len(sim)} mesi (ultimo saldo simulato: {sim['saldo_sim'].iloc[-1]:,.2f} €)")
-
-        # grafico saldo simulato
-        fig_sim = go.Figure()
-        fig_sim.add_trace(go.Scatter(name="Saldo simulato", x=sim["mese"], y=sim["saldo_sim"], mode="lines+markers"))
-        fig_sim.add_hline(y=float(target_balance), line_dash="dash", annotation_text="Target", annotation_position="top left")
-        fig_sim.update_layout(xaxis_title="Mese", yaxis_title="Saldo (€)")
-        st.plotly_chart(fig_sim, use_container_width=True)
-
-        # dettaglio tabellare
-        st.markdown("**Dettaglio simulazione**")
-        sim_view = sim.copy()
-        sim_view["entrate_sim"] = sim_view["entrate_sim"].round(2)
-        sim_view["uscite_sim"] = sim_view["uscite_sim"].round(2)
-        sim_view["netto_sim"] = sim_view["netto_sim"].round(2)
-        sim_view["saldo_sim"] = sim_view["saldo_sim"].round(2)
-        st.dataframe(sim_view, use_container_width=True)
-
-st.divider()
-
-# =========================
-# TABELLA MOVIMENTI
-# =========================
-st.subheader("📄 Movimenti (categoria + cluster + pagamento)")
-display_cols = []
-if c_date is not None:
-    display_cols.append(c_date)
-display_cols += [c_desc, c_amt]
-if c_pay is not None:
-    display_cols.append(c_pay)
-
-view = out.copy()
-view["Categoria"] = view["_category"]
-view["Cluster"] = view["_cluster"]
-view["Titolo cluster"] = view["_cluster_title"]
-view["Pagamento"] = view["_payment_type"]
-
-# ordina per data (se presente)
-if c_date is not None and out["_date"].notna().any():
-    view = view.sort_values("_date", ascending=False)
-
-st.dataframe(
-    view[display_cols + ["Categoria", "Pagamento", "Cluster", "Titolo cluster"]],
-    use_container_width=True
-)

@@ -3,4 +3,6 @@ pandas
 numpy
 plotly
 openpyxl
+requests
+python-dateutil
 scikit-learn
