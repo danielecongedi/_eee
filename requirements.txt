@@ -4,6 +4,3 @@ numpy
 plotly
 scikit-learn
 openpyxl
-transformers
-torch
-sentence-transformers
