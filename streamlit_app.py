@@ -15,10 +15,9 @@ from transformers import pipeline
 st.set_page_config(page_title="Dashboard Spese", layout="wide", page_icon="💳")
 st.title("💳 Dashboard spese (AI tagging)")
 
-SALDO_CELL = "F1"
 MIN_ROWS_FOR_CLUSTER = 30
 
-# Macro-tag candidati (QUI sì: solo le classi, non keyword)
+# Macro-tag candidati (solo le classi, non keyword)
 MACRO_TAGS = [
     "Viaggi", "Cibo", "Casa", "Auto/Trasporti", "Abbonamenti",
     "Shopping", "Salute", "Svago", "Commissioni/Banca", "Entrate", "Altro"
@@ -33,17 +32,6 @@ def norm_text(x) -> str:
     s = str(x).strip()
     s = re.sub(r"\s+", " ", s)
     return s
-
-def excel_cell_to_idx(cell: str):
-    cell = cell.upper().strip()
-    col_letters = re.findall(r"[A-Z]+", cell)[0]
-    row_number = int(re.findall(r"\d+", cell)[0])
-    col_idx = 0
-    for ch in col_letters:
-        col_idx = col_idx * 26 + (ord(ch) - ord("A") + 1)
-    col_idx -= 1
-    row_idx = row_number - 1
-    return row_idx, col_idx
 
 def parse_amount(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.replace("€", "", regex=False).str.strip()
@@ -67,26 +55,50 @@ def infer_col(df: pd.DataFrame, candidates):
 def load_first_sheet(file_bytes: bytes):
     xls = pd.ExcelFile(file_bytes)
     first_sheet = xls.sheet_names[0]
-    df = pd.read_excel(file_bytes, sheet_name=first_sheet)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    raw = pd.read_excel(file_bytes, sheet_name=first_sheet, header=None)
-    r, c = excel_cell_to_idx(SALDO_CELL)
+    
+    # 1. Leggiamo solo le prime 25 righe in modalità "grezza" per cercare l'Intestazione e il Saldo
+    raw_head = pd.read_excel(file_bytes, sheet_name=first_sheet, header=None, nrows=25)
+    
     saldo = None
-    if r < raw.shape[0] and c < raw.shape[1]:
-        v = raw.iat[r, c]
-        if isinstance(v, str):
-            vv = v.replace("€", "").strip().replace(".", "").replace(",", ".")
-            try:
-                saldo = float(vv)
-            except:
-                saldo = None
-        elif pd.notna(v):
-            try:
-                saldo = float(v)
-            except:
-                saldo = None
+    header_row = 0
+    
+    # Scansione dinamica per trovare riga dei titoli e saldo contabile
+    for idx, row in raw_head.iterrows():
+        # Convertiamo tutta la riga in minuscolo per una ricerca facile
+        row_str_lower = [str(x).lower().strip() for x in row.dropna().tolist()]
+        
+        # --- RICERCA SALDO ---
+        if any("saldo" in val for val in row_str_lower) and saldo is None:
+            for val in row.dropna().tolist():
+                if isinstance(val, (int, float)):
+                    saldo = float(val)
+                elif isinstance(val, str):
+                    clean_val = val.replace("€", "").strip()
+                    # Normalizziamo virgole e punti italiani in formato standard float
+                    if clean_val.count('.') <= 1 and clean_val.count(',') == 0:
+                        pass # Formato US
+                    elif clean_val.count(',') == 1 and clean_val.count('.') == 0:
+                        clean_val = clean_val.replace(',', '.') # Formato IT base
+                    else:
+                        clean_val = clean_val.replace(".", "").replace(",", ".") # Formato 22.826,77
+                        
+                    try:
+                        saldo = float(clean_val)
+                    except ValueError:
+                        continue
+        
+        # --- RICERCA INTESTAZIONE DATI ---
+        if any("importo" in val for val in row_str_lower) and any("data" in val for val in row_str_lower):
+            header_row = idx
+            break
 
+    # 2. Carichiamo il DataFrame reale, ignorando le righe inutili sopra l'intestazione
+    df = pd.read_excel(file_bytes, sheet_name=first_sheet, skiprows=header_row)
+    
+    # 3. Pulizia base nomi colonne e rimozione colonne vuote ("Unnamed")
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.contains('^Unnamed', case=False, na=False)]
+    
     return df, first_sheet, saldo
 
 @st.cache_resource(show_spinner=False)
@@ -106,7 +118,7 @@ def ai_tag_descriptions(desc_list, amounts, zsc, labels):
     uniq = list(dict.fromkeys(desc_list))
     mapping = {}
 
-    # Batch “a chunk” per non rallentare troppo
+    # Batch "a chunk" per non rallentare troppo
     chunk = 32
     for i in range(0, len(uniq), chunk):
         batch = uniq[i:i+chunk]
@@ -137,7 +149,7 @@ def cluster_embeddings(embeddings, desired_k=12):
 # =========================
 # APP
 # =========================
-uploaded = st.file_uploader("Carica Excel (movimenti nel primo foglio + saldo in F1)", type=["xlsx", "xls"])
+uploaded = st.file_uploader("Carica Excel (movimenti nel primo foglio)", type=["xlsx", "xls"])
 if not uploaded:
     st.stop()
 
@@ -204,12 +216,12 @@ tot_spese = out.loc[out["_amount"] < 0, "_amount"].sum()
 tot_entrate = out.loc[out["_amount"] > 0, "_amount"].sum()
 netto = out["_amount"].sum()
 
-c1.metric("Saldo (Excel F1)", f"{saldo_value:,.2f} €" if saldo_value is not None else "N/D")
+c1.metric("Saldo (estratto)", f"{saldo_value:,.2f} €" if saldo_value is not None else "N/D")
 c2.metric("Entrate (periodo)", f"{tot_entrate:,.2f} €")
 c3.metric("Uscite (periodo)", f"{tot_spese:,.2f} €")
 c4.metric("Netto (entrate+uscite)", f"{netto:,.2f} €")
 
-st.caption(f"Foglio letto: **{sheet_name}** | Saldo da cella **{SALDO_CELL}**")
+st.caption(f"Foglio letto: **{sheet_name}** | Saldo individuato **automaticamente**")
 
 st.divider()
 
