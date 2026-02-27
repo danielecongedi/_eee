@@ -7,23 +7,14 @@ import plotly.graph_objects as go
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 
-st.set_page_config(page_title="Bank Spend Analytics", page_icon="🏦", layout="wide")
-
-# =========================
-# COLONNE ATTESE (nel file)
-# =========================
-COL_DATE = "Data valuta"
-COL_DESC = "Descrizione"
-COL_AMOUNT = "Importo"
+st.set_page_config(page_title="Bank  Analytics", page_icon="🏦", layout="wide")
+st.title("🏦 Bank  Analytics")
 
 NET_ORANGE = "#F28C28"
 
 # =========================
-# Helpers base
+# Helpers parsing
 # =========================
-def normalize_col_lookup(cols):
-    return {str(c).strip().lower(): c for c in cols}
-
 def parse_date(series: pd.Series) -> pd.Series:
     if pd.api.types.is_datetime64_any_dtype(series):
         return pd.to_datetime(series, errors="coerce")
@@ -32,7 +23,6 @@ def parse_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(s, dayfirst=True, errors="coerce", infer_datetime_format=True)
 
 def parse_amount(series: pd.Series) -> pd.Series:
-    # robust IT/EN
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
 
@@ -71,10 +61,6 @@ def parse_amount(series: pd.Series) -> pd.Series:
 
     return out
 
-@st.cache_data(show_spinner=False)
-def load_xlsx_from_upload(file_bytes: bytes, sheet_name: str | None = None) -> pd.DataFrame:
-    return pd.read_excel(BytesIO(file_bytes), sheet_name=(sheet_name if sheet_name else 0), engine="openpyxl")
-
 def month_str(dt: date) -> str:
     return f"{dt.year:04d}-{dt.month:02d}"
 
@@ -84,13 +70,71 @@ def month_add(ym: str, n: int) -> str:
     d1 = d0 + relativedelta(months=n)
     return month_str(d1)
 
+def infer_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = list(df.columns)
+    cols_l = {str(c).strip().lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in cols_l:
+            return cols_l[cand.lower()]
+    for c in cols:
+        cl = str(c).strip().lower()
+        if any(k in cl for k in candidates):
+            return c
+    return None
+
+@st.cache_data(show_spinner=False)
+def load_template_excel(file_bytes: bytes):
+    xls = pd.ExcelFile(BytesIO(file_bytes))
+    sheet_name = xls.sheet_names[0]
+
+    raw_head = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=40)
+
+    header_row = None
+    saldo_value = None
+
+    for i in range(len(raw_head)):
+        row = raw_head.iloc[i].dropna().astype(str).str.strip()
+        if row.empty:
+            continue
+        low = " | ".join(row.str.lower().tolist())
+        if ("data" in low) and ("importo" in low):
+            header_row = i
+            break
+
+    for i in range(len(raw_head)):
+        row = raw_head.iloc[i]
+        row_str = row.astype(str).str.lower()
+        if row_str.str.contains("saldo contabile").any():
+            for v in row.tolist():
+                if isinstance(v, (int, float)) and not (pd.isna(v)):
+                    saldo_value = float(v)
+            if saldo_value is None:
+                for v in row.tolist():
+                    if isinstance(v, str) and v.strip():
+                        vv = v.replace("€", "").strip()
+                        vv = vv.replace(".", "").replace(",", ".") if ("," in vv and "." in vv) else vv.replace(",", ".")
+                        try:
+                            saldo_value = float(vv)
+                        except Exception:
+                            pass
+
+    if header_row is None:
+        header_row = 0
+
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, skiprows=header_row)
+
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", case=False, na=False)]
+
+    return df, sheet_name, saldo_value
+
 # =========================
-# Tipologie di SPESA (regole forti)
+# Regole categorie (spesa)
 # =========================
-def categorize_spend_rule(desc: str) -> str | None:
-    if desc is None:
+def categorize_spend_rule(text: str) -> str | None:
+    if text is None:
         return None
-    d = str(desc).strip().lower()
+    d = str(text).strip().lower()
 
     if any(k in d for k in ["movocchiali", "occhial", "ottica", "lenti", "visita", "studio medico", "medic", "dott", "clinica", "osped", "dent", "ticket", "farmac"]):
         return "Salute"
@@ -112,32 +156,9 @@ def categorize_spend_rule(desc: str) -> str | None:
         return "Tecnologia"
     if any(k in d for k in ["acqua e sapone", "acqua&sapone", "tigot", "dm", "detersiv", "sapone", "shampoo", "profumer"]):
         return "Casa / Cura persona"
-    if any(k in d for k in ["coop", "conad", "esselunga", "carrefour", "lidl", "aldi", "super", "market", "ristor", "trattor", "oster", "pizzer", "bar", "gelat", "pescher", "maceller", "forno", "gastronom"]):
+    if any(k in d for k in ["coop", "conad", "esselunga", "carrefour", "lidl", "aldi", "super", "market", "ristor", "trattor", "oster", "pizzer", "bar", "gelat", "pescher", "maceller", "forno", "gastronom", "glovo", "deliveroo", "just eat"]):
         return "Cibo / Spesa / Ristoranti"
-
     return None
-
-# =========================
-# Tipologie di PAGAMENTO (rule)
-# =========================
-def payment_type_rule(desc: str) -> str:
-    d = ("" if desc is None else str(desc)).strip().lower()
-
-    if any(k in d for k in ["preliev", "atm", "bancomat", "contanti"]):
-        return "Prelievo"
-    if any(k in d for k in ["bonifico", "giroconto", "sepa credit", "sepa trasfer"]):
-        return "Bonifico"
-    if any(k in d for k in ["sdd", "rid", "addebito diretto", "direct debit"]):
-        return "Addebito diretto"
-    if any(k in d for k in ["pagopa", "f24", "tribut", "impost", "tari"]):
-        return "PagoPA / Tributi"
-    if any(k in d for k in ["commission", "canone", "spese tenuta", "imposta di bollo", "bollo"]):
-        return "Commissioni / Canoni"
-    if any(k in d for k in ["pos", "carta", "pagamento", "mastercard", "visa"]):
-        return "Carta"
-    if any(k in d for k in ["srl", "spa", "ristor", "market", "super", "shop", "store", "amazon", "zalando", "vodafone", "netflix"]):
-        return "Carta"
-    return "Altro"
 
 # =========================
 # Clustering opzionale + titoli cluster
@@ -154,11 +175,11 @@ def pretty_cluster_title(top_terms: list[str]) -> str:
         return "Streaming"
     if any(k in t for k in ["ticketone", "vivaticket", "concert", "evento"]):
         return "Concerti / Eventi"
-    if any(k in t for k in ["booking", "airbnb", "trenitalia", "italo", "ryanair", "easyjet", "marino", "flixbus", "hotel", "volo"]):
+    if any(k in t for k in ["booking", "airbnb", "trenitalia", "italo", "ryanair", "easyjet", "hotel", "volo"]):
         return "Viaggi"
     if any(k in t for k in ["farmac", "medic", "dott", "visita", "ottica", "occhial", "lenti", "dent", "ticket"]):
         return "Salute"
-    if any(k in t for k in ["zalando", "zara", "hm", "h&m", "decathlon", "nike", "adidas", "piazza"]):
+    if any(k in t for k in ["zalando", "zara", "hm", "h&m", "decathlon", "nike", "adidas"]):
         return "Abbigliamento / Sport"
     if any(k in t for k in ["mediaworld", "unieuro", "apple", "huawei", "samsung", "amazon", "pc", "iphone"]):
         return "Tecnologia"
@@ -209,7 +230,7 @@ def ai_cluster_unknowns_with_titles(unknown_desc: pd.Series, n_clusters: int = 6
     return labels, info
 
 # =========================
-# Forecast entrate “shape”
+# Forecast entrate: shape da storico
 # =========================
 def forecast_with_shape(series: pd.Series, months: pd.Series, horizon: int) -> list[float]:
     df = pd.DataFrame({"month": months.astype(str), "y": series.astype(float)})
@@ -245,42 +266,46 @@ def forecast_with_shape(series: pd.Series, months: pd.Series, horizon: int) -> l
 
 
 # =========================
-# UI: Upload obbligatorio
+# Upload (obbligatorio)
 # =========================
-st.title("🏦 Bank Spend Analytics (Excel upload)")
-
 uploaded = st.file_uploader(
     "Trascina qui l'Excel (drag & drop) oppure clicca per selezionare",
     type=["xlsx", "xls"],
 )
-
 if uploaded is None:
     st.info("Carica un file Excel per iniziare.")
     st.stop()
 
 try:
-    raw = load_xlsx_from_upload(uploaded.getvalue(), sheet_name=None)
+    raw, sheet_name, saldo_extracted = load_template_excel(uploaded.getvalue())
 except Exception as e:
     st.error(f"Errore lettura Excel: {e}")
     st.stop()
 
-# validazione colonne
-cols_norm = normalize_col_lookup(raw.columns)
-need = [COL_DATE, COL_DESC, COL_AMOUNT]
-missing = [c for c in need if c.strip().lower() not in cols_norm]
-if missing:
-    st.error(f"Mancano colonne nel file: {missing}\nColonne trovate: {list(raw.columns)}")
+# =========================
+# Adattamento al template: colonne dinamiche
+# =========================
+c_date = infer_col(raw, ["data valuta", "valuta", "data"])
+c_desc = infer_col(raw, ["descrizione", "causale", "merchant"])
+c_detail = infer_col(raw, ["dettaglio", "details", "note"])
+c_amount = infer_col(raw, ["importo", "amount", "valore"])
+
+if c_date is None or c_desc is None or c_amount is None:
+    st.error("Non riesco a identificare le colonne chiave nel file.\n\n"
+             f"Colonne trovate: {list(raw.columns)}")
     st.stop()
 
-col_date = cols_norm[COL_DATE.lower()]
-col_desc = cols_norm[COL_DESC.lower()]
-col_amount = cols_norm[COL_AMOUNT.lower()]
-
-# prepara df
 df = raw.copy()
-df["date"] = parse_date(df[col_date])
-df["amount"] = parse_amount(df[col_amount])
-df["description"] = df[col_desc].astype(str).str.strip()
+df["date"] = parse_date(df[c_date])
+df["amount"] = parse_amount(df[c_amount])
+df["description"] = df[c_desc].astype(str).str.strip()
+
+if c_detail is not None:
+    df["detail"] = df[c_detail].astype(str).str.strip()
+else:
+    df["detail"] = ""
+
+df["text_all"] = (df["description"].fillna("").astype(str) + " " + df["detail"].fillna("").astype(str)).str.strip()
 
 df = df.dropna(subset=["date", "amount"]).copy()
 df["date"] = pd.to_datetime(df["date"])
@@ -289,7 +314,7 @@ df = df.sort_values("date").reset_index(drop=True)
 min_d = df["date"].min().date()
 max_d = df["date"].max().date()
 
-# TOP: periodo + saldo
+# TOP: periodo + saldo (prefill da estratto)
 topA, topB = st.columns([2, 1])
 with topA:
     period = st.date_input(
@@ -299,8 +324,10 @@ with topA:
         max_value=max_d,
     )
     d_from, d_to = period if isinstance(period, tuple) else (min_d, max_d)
+
 with topB:
-    current_balance = st.number_input("Saldo contabile attuale (€) (manuale)", value=0.0, step=100.0)
+    default_balance = float(saldo_extracted) if (saldo_extracted is not None) else 0.0
+    current_balance = st.number_input("Saldo contabile attuale (€)", value=default_balance, step=100.0)
 
 dfp = df[(df["date"].dt.date >= d_from) & (df["date"].dt.date <= d_to)].copy()
 if dfp.empty:
@@ -327,7 +354,7 @@ avg_net_month = float(m["net"].mean()) if len(m) else 0.0
 
 # KPI
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Saldo attuale", f"€ {float(current_balance):,.2f}", "manuale")
+k1.metric("Saldo attuale", f"€ {float(current_balance):,.2f}", "da file" if saldo_extracted is not None else "manuale")
 k2.metric("Entrate (periodo)", f"€ {float(income_total):,.2f}")
 k3.metric("Uscite (periodo)", f"€ {float(expense_total):,.2f}")
 k4.metric("Netto (periodo)", f"€ {float(net_total):,.2f}")
@@ -337,6 +364,7 @@ a1.metric("Entrate medie mensili", f"€ {avg_income_month:,.2f}")
 a2.metric("Uscite medie mensili", f"€ {avg_expense_month:,.2f}")
 a3.metric("Netto medio mensile", f"€ {avg_net_month:,.2f}")
 
+st.caption(f"Foglio letto: {sheet_name} | Colonne usate: Data='{c_date}', Descrizione='{c_desc}', Dettaglio='{c_detail}', Importo='{c_amount}'")
 st.markdown("---")
 
 # =========================
@@ -344,7 +372,6 @@ st.markdown("---")
 # =========================
 st.subheader("Cumulata saldo nel periodo (da movimenti)")
 
-# Se current_balance è 0 (default), la cumulata sarà “relativa”
 saldo_iniziale_stimato = float(current_balance) - float(m["net"].sum())
 use_manual_start = st.checkbox("Imposta manualmente saldo iniziale del periodo", value=False)
 if use_manual_start:
@@ -403,44 +430,6 @@ st.plotly_chart(fig_ma, use_container_width=True)
 st.markdown("---")
 
 # =========================
-# TIPI DI PAGAMENTO
-# =========================
-st.subheader("Tipologie di pagamento")
-
-dfp["payment_type"] = dfp["description"].apply(payment_type_rule)
-
-pay = dfp[dfp["amount"] < 0].copy()
-if pay.empty:
-    st.info("Nessuna uscita nel periodo per tipologie di pagamento.")
-else:
-    pay["expense_abs"] = -pay["amount"]
-    pay_tot = pay.groupby("payment_type", as_index=False)["expense_abs"].sum().sort_values("expense_abs", ascending=False)
-
-    cL, cR = st.columns([2, 1])
-    with cL:
-        fig_pay = go.Figure()
-        fig_pay.add_trace(go.Bar(x=pay_tot["expense_abs"], y=pay_tot["payment_type"], orientation="h", name="Spesa"))
-        fig_pay.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig_pay, use_container_width=True)
-    with cR:
-        t = pay_tot.copy()
-        t["Spesa (€)"] = t["expense_abs"].round(2)
-        t = t.drop(columns=["expense_abs"])
-        st.dataframe(t, use_container_width=True, hide_index=True)
-
-    st.subheader("Uscite mensili per tipologia di pagamento")
-    pay_month = pay.groupby(["month", "payment_type"], as_index=False)["expense_abs"].sum()
-    pay_piv = pay_month.pivot(index="month", columns="payment_type", values="expense_abs").fillna(0.0)
-
-    fig_pay_stack = go.Figure()
-    for c in pay_piv.columns:
-        fig_pay_stack.add_trace(go.Bar(x=pay_piv.index, y=pay_piv[c], name=str(c)))
-    fig_pay_stack.update_layout(barmode="stack", margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig_pay_stack, use_container_width=True)
-
-st.markdown("---")
-
-# =========================
 # SPESE per CATEGORIA (regole + clustering opzionale)
 # =========================
 st.subheader("Spese per tipologia (categorie)")
@@ -450,12 +439,12 @@ if sp.empty:
     st.info("Nessuna spesa nel periodo.")
 else:
     sp["expense_abs"] = -sp["amount"]
-    sp["category"] = sp["description"].apply(categorize_spend_rule)
+    sp["category"] = sp["text_all"].apply(categorize_spend_rule)
 
     unknown_mask = sp["category"].isna()
     cluster_info = None
     if unknown_mask.any():
-        labels, cluster_info = ai_cluster_unknowns_with_titles(sp.loc[unknown_mask, "description"], n_clusters=6)
+        labels, cluster_info = ai_cluster_unknowns_with_titles(sp.loc[unknown_mask, "text_all"], n_clusters=6)
         sp.loc[unknown_mask, "category"] = labels
 
     cat_total = (
@@ -481,6 +470,7 @@ else:
         with st.expander("Debug cluster (titoli + top termini)"):
             st.dataframe(cluster_info, use_container_width=True, hide_index=True)
 
+    # ✅ mantengo SOLO lo stacked mensile per categoria (come richiesto)
     st.subheader("Uscite mensili per categoria (stacked)")
     cat_month = sp.groupby(["month", "category"], as_index=False)["expense_abs"].sum()
     piv = cat_month.pivot(index="month", columns="category", values="expense_abs").fillna(0.0)
@@ -490,12 +480,6 @@ else:
         fig_stack.add_trace(go.Bar(x=piv.index, y=piv[c], name=str(c)))
     fig_stack.update_layout(barmode="stack", margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig_stack, use_container_width=True)
-
-    st.subheader("Totale periodo per categoria")
-    fig_total = go.Figure()
-    fig_total.add_trace(go.Bar(x=cat_total["expense_abs"], y=cat_total["category"], orientation="h"))
-    fig_total.update_layout(margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig_total, use_container_width=True)
 
 st.markdown("---")
 
@@ -514,7 +498,6 @@ with simC:
 
 last_month = m["month"].iloc[-1]
 months_future = [month_add(last_month, i) for i in range(1, int(horizon) + 1)]
-
 income_fc = forecast_with_shape(m["income"], m["month"], horizon=int(horizon))
 
 balances = []
@@ -558,8 +541,6 @@ with st.expander("Dettaglio simulazione"):
 st.markdown("---")
 
 with st.expander("Movimenti filtrati (debug)"):
-    st.dataframe(
-        dfp[["date", "month", "description", "amount", "payment_type"]].sort_values("date", ascending=False),
-        use_container_width=True,
-        hide_index=True
-    )
+    show_cols = ["date", "month", "description", "detail", "amount", "text_all"]
+    show_cols = [c for c in show_cols if c in dfp.columns]
+    st.dataframe(dfp[show_cols].sort_values("date", ascending=False), use_container_width=True, hide_index=True)
