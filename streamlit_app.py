@@ -30,11 +30,53 @@ def norm_text(x) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+
 def parse_amount(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.replace("€", "", regex=False).str.strip()
-    s = s.str.replace(".", "", regex=False)
-    s = s.str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+    """
+    Parsing robusto:
+    - Se la cella è numerica -> usa direttamente quel numero
+    - Se stringa:
+        * formato IT: 1.234,56 -> 1234.56
+        * formato IT base: 1234,56 -> 1234.56
+        * formato EN: 1234.56 -> 1234.56 (NON rimuovere punti!)
+    """
+    def clean_value(val):
+        if pd.isna(val):
+            return np.nan
+
+        # Se Excel l'ha già letto come numero, non “rompere” nulla
+        if isinstance(val, (int, float, np.integer, np.floating)):
+            return float(val)
+
+        s = str(val).strip()
+        s = s.replace("€", "").replace("\u00a0", "").replace(" ", "")
+
+        # supporto segno negativo tipo "(123,45)"
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+
+        # Se contiene sia '.' che ',' decidiamo quale è decimale
+        if "," in s and "." in s:
+            # se la virgola è dopo l'ultimo punto -> IT (1.234,56)
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                # raro: 1,234.56 (EN con migliaia)
+                s = s.replace(",", "")
+        elif "," in s and "." not in s:
+            # IT base: 1234,56
+            s = s.replace(",", ".")
+        else:
+            # EN base: 1234.56 -> lascia così
+            pass
+
+        try:
+            return float(s)
+        except ValueError:
+            return np.nan
+
+    return series.apply(clean_value)
+
 
 def infer_col(df: pd.DataFrame, candidates):
     cols = list(df.columns)
@@ -47,6 +89,7 @@ def infer_col(df: pd.DataFrame, candidates):
         if any(k in cl for k in candidates):
             return c
     return None
+
 
 @st.cache_data(show_spinner=False)
 def load_first_sheet(file_bytes: bytes):
@@ -68,18 +111,13 @@ def load_first_sheet(file_bytes: bytes):
                     saldo = float(val)
                     break
                 elif isinstance(val, str):
-                    clean_val = val.replace("€", "").strip()
-                    if clean_val.count('.') <= 1 and clean_val.count(',') == 0:
-                        pass
-                    elif clean_val.count(',') == 1 and clean_val.count('.') == 0:
-                        clean_val = clean_val.replace(',', '.')
-                    else:
-                        clean_val = clean_val.replace(".", "").replace(",", ".")
-                    try:
-                        saldo = float(clean_val)
+                    clean_val = val.replace("€", "").replace(" ", "").strip()
+
+                    # prova parsing robusto su stringa
+                    tmp = parse_amount(pd.Series([clean_val])).iloc[0]
+                    if not pd.isna(tmp):
+                        saldo = float(tmp)
                         break
-                    except ValueError:
-                        continue
 
         # --- RICERCA INTESTAZIONE DATI ---
         if any("importo" in val for val in row_str_lower) and any("data" in val for val in row_str_lower):
@@ -87,11 +125,18 @@ def load_first_sheet(file_bytes: bytes):
             break
 
     df = pd.read_excel(file_bytes, sheet_name=first_sheet, skiprows=header_row)
-
     df.columns = [str(c).strip() for c in df.columns]
-    df = df.loc[:, ~df.columns.str.contains('^Unnamed', case=False, na=False)]
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed", case=False, na=False)]
 
     return df, first_sheet, saldo
+
+
+def make_embeddings_tfidf(desc_list):
+    vect = TfidfVectorizer(min_df=1, max_features=5000, ngram_range=(1, 2))
+    X = vect.fit_transform(desc_list)
+    X = normalize(X)
+    return X
+
 
 def cluster_labels(matrix, desired_k=12):
     n = matrix.shape[0]
@@ -102,23 +147,14 @@ def cluster_labels(matrix, desired_k=12):
     km = KMeans(n_clusters=k, random_state=42, n_init=10)
     return km.fit_predict(matrix)
 
-def make_embeddings_tfidf(desc_list):
-    vect = TfidfVectorizer(min_df=1, max_features=5000, ngram_range=(1, 2))
-    X = vect.fit_transform(desc_list)
-    X = normalize(X)
-    return X
 
 def tag_fallback(desc_list, amounts):
-    """
-    Tagging leggero: regole base + override Entrate se importo > 0.
-    Puoi estendere liberamente rules.
-    """
     rules = {
-        "Cibo": ["bar", "rist", "pizz", "burger", "caff", "supermerc", "coop", "esselunga", "conad", "carrefour", "glovo", "deliveroo", "just eat"],
+        "Cibo": ["bar", "rist", "pizz", "burger", "caff", "supermerc", "coop", "esselunga", "conad", "carrefour", "glovo", "deliveroo", "justeat", "just eat"],
         "Casa": ["affitto", "condominio", "luce", "gas", "acqua", "internet", "tim", "vodafone", "wind", "enel", "a2a", "tari"],
-        "Auto/Trasporti": ["benz", "diesel", "eni", "q8", "es", "autostr", "telepass", "tren", "tram", "metro", "taxi", "uber", "italo", "trenitalia"],
-        "Abbonamenti": ["netflix", "spotify", "prime", "amazon prime", "disney", "abbon", "subscription"],
-        "Shopping": ["amazon", "ikea", "zara", "h&m", "decathlon", "mediaworld", "unieuro"],
+        "Auto/Trasporti": ["benz", "diesel", "eni", "q8", "autostr", "telepass", "tren", "tram", "metro", "taxi", "uber", "italo", "trenitalia"],
+        "Abbonamenti": ["netflix", "spotify", "prime", "amazonprime", "amazon prime", "disney", "abbon", "subscription"],
+        "Shopping": ["amazon", "ikea", "zara", "hm", "h&m", "decathlon", "mediaworld", "unieuro"],
         "Salute": ["farm", "medic", "ticket", "dent", "osped", "clinic"],
         "Svago": ["cinema", "teatro", "concerto", "pub", "aperi", "discoteca"],
         "Commissioni/Banca": ["commission", "canone", "imposta", "bollo", "spese", "fee", "prelievo", "bonifico", "ricarica", "carta"],
@@ -154,7 +190,6 @@ except Exception as e:
     st.error(f"Errore lettura Excel: {e}")
     st.stop()
 
-# colonne
 c_date = infer_col(df, ["data", "date"])
 c_desc = infer_col(df, ["descrizione", "description", "causale", "dettaglio", "merchant", "nome", "desc"])
 c_amt  = infer_col(df, ["importo", "amount", "valore", "movimento", "€", "eur"])
@@ -164,18 +199,29 @@ if c_desc is None or c_amt is None:
     st.stop()
 
 out = df.copy()
+
+# parsing corretto importi
 out["_amount"] = parse_amount(out[c_amt])
 out = out.dropna(subset=["_amount"])
 
+# data
 if c_date is not None:
     out["_date"] = pd.to_datetime(out[c_date], errors="coerce", dayfirst=True)
 else:
     out["_date"] = pd.NaT
 
-out["_desc_raw"] = out[c_desc].astype(str).map(norm_text)
+# descrizione
+out["_desc_raw"] = out[c_desc].astype(str).map(lambda x: re.sub(r"\s+", " ", str(x).strip()))
 
 desc_list = out["_desc_raw"].tolist()
 amounts = out["_amount"].tolist()
+
+# debug toggle
+debug = st.sidebar.toggle("🔎 Debug importi", value=False)
+if debug and len(out):
+    st.sidebar.write("Min importo:", float(out["_amount"].min()))
+    st.sidebar.write("Max importo:", float(out["_amount"].max()))
+    st.sidebar.write("Esempi importi:", out["_amount"].head(10).tolist())
 
 # embeddings (TF-IDF) + clustering
 with st.spinner("Creo embeddings (TF-IDF) + clustering..."):
@@ -186,7 +232,7 @@ with st.spinner("Creo embeddings (TF-IDF) + clustering..."):
 with st.spinner("Assegno macro-tag (regole leggere)..."):
     out["_macro_tag"] = tag_fallback(desc_list, amounts)
 
-# cluster -> macro dominante (aiuta a uniformare pattern simili)
+# cluster -> macro dominante
 cluster_macro = (
     out.groupby("_cluster")["_macro_tag"]
       .agg(lambda s: s.value_counts().index[0])
@@ -229,7 +275,13 @@ with right:
     st.subheader("📊 Spese per macro attività")
     tmp = out[out["_amount"] < 0].copy()
     if len(tmp):
-        by_tag = tmp.groupby("_macro_tag")["_amount"].sum().abs().sort_values(ascending=False).head(12).reset_index()
+        by_tag = (
+            tmp.groupby("_macro_tag")["_amount"]
+            .sum().abs()
+            .sort_values(ascending=False)
+            .head(12)
+            .reset_index()
+        )
         fig2 = px.bar(by_tag, x="_macro_tag", y="_amount")
         fig2.update_layout(xaxis_title="Macro attività", yaxis_title="Spesa (€)")
         st.plotly_chart(fig2, use_container_width=True)
@@ -252,4 +304,7 @@ view["Tag cluster"] = view["_cluster_macro_tag"]
 if c_date is not None and view["_date"].notna().any():
     view = view.sort_values("_date", ascending=False)
 
-st.dataframe(view[display_cols + ["Macro attività", "Cluster", "Tag cluster"]], use_container_width=True)
+st.dataframe(
+    view[display_cols + ["Macro attività", "Cluster", "Tag cluster"]],
+    use_container_width=True
+)
