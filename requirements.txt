@@ -2,7 +2,8 @@ streamlit
 pandas
 numpy
 plotly
-openpyxl
-python-dateutil
-requests
 scikit-learn
+openpyxl
+transformers
+torch
+sentence-transformers
