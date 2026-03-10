@@ -2,6 +2,7 @@ streamlit
 pandas
 numpy
 plotly
-openpyxl
 python-dateutil
+openpyxl
 scikit-learn
+xlrd
